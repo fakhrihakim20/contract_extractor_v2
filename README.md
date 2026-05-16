@@ -8,7 +8,7 @@ Streamlit app untuk membaca PDF kontrak dari Google Drive, mengekstrak draft met
 - Supabase Python client dengan `SUPABASE_SERVICE_ROLE_KEY` di server-side secrets
 - Google Drive API service account untuk folder PDF private
 - PyMuPDF untuk text-native PDF
-- PaddleOCR untuk fallback OCR halaman scan, dipisah sebagai optional dependency agar app tetap bisa boot di Streamlit Cloud free tier
+- dots.ocr/dots.mocr untuk fallback OCR halaman scan via vLLM OpenAI-compatible endpoint
 - Taste-skill UI theme: premium operations console, `Outfit` + `JetBrains Mono`, matte neutral surfaces, and a single blue-gray accent
 
 ## Secrets
@@ -20,6 +20,9 @@ SUPABASE_URL = "https://cxretrzlhzsijiegyiwl.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "replace-with-service-role-key"
 GOOGLE_DRIVE_FOLDER_ID = "replace-with-folder-id"
 GOOGLE_SERVICE_ACCOUNT_JSON = """{"type":"service_account", "...":"..."}"""
+DOTS_OCR_BASE_URL = "https://your-dots-ocr-vllm-host/v1"
+DOTS_OCR_MODEL = "rednote-hilab/dots.mocr"
+DOTS_OCR_API_KEY = "0"
 ```
 
 Share folder Google Drive sumber PDF ke email `client_email` dari service account.
@@ -35,22 +38,20 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-PaddleOCR akan mengunduh model OCR saat pertama kali dipakai. PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa memuat PaddleOCR.
+dots.ocr berjalan sebagai service terpisah. PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa memanggil endpoint OCR; halaman scan akan dirender sebagai PNG dan dikirim ke `DOTS_OCR_BASE_URL`.
 
-## OCR Dependency
+## dots.ocr Runtime
 
 `requirements.txt` sengaja dibuat ringan agar Streamlit Cloud tidak gagal saat install.
-Kode OCR tetap memakai PaddleOCR, tetapi dependency beratnya ada di `requirements-ocr.txt`.
+Kode OCR wajib memakai dots.ocr/dots.mocr, tetapi modelnya harus berjalan di environment GPU terpisah sebagai vLLM OpenAI-compatible server.
 
-Untuk environment yang kuat:
+Contoh target endpoint yang dipakai app:
 
-```bash
-python -m pip install -r requirements.txt
-python -m pip install -r requirements-ocr.txt
+```text
+POST {DOTS_OCR_BASE_URL}/chat/completions
 ```
 
-Di Streamlit Cloud free tier, app tetap bisa import dan memproses PDF text-native tanpa OCR.
-Jika PDF scan memerlukan OCR dan PaddleOCR belum terpasang di runtime, job akan gagal dengan pesan konfigurasi OCR yang eksplisit, bukan membuat seluruh app gagal install.
+Gunakan upstream `rednote-hilab/dots.ocr` untuk menjalankan model di server GPU, lalu isi `DOTS_OCR_BASE_URL`, `DOTS_OCR_MODEL`, dan `DOTS_OCR_API_KEY` di Streamlit secrets.
 
 ## Workflow
 
@@ -65,7 +66,7 @@ Tidak ada migrasi awal. App memakai tabel lama:
 
 - `documents.storage_bucket = "google-drive"`
 - `documents.storage_path = "gdrive:<drive_file_id>"`
-- `extraction_jobs.model = "local-paddleocr-regex-v1"`
+- `extraction_jobs.model = "dots-mocr-vllm-regex-v1"`
 - Draft disimpan ke `contract_extraction_drafts` dan `boq_extraction_draft_items`
 - Approval tetap lewat `approve_contract_document`
 

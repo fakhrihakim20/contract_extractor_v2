@@ -1,6 +1,10 @@
-# Optional PaddleOCR runtime dependencies.
-# Streamlit Cloud free tier can fail while installing these large packages.
-# Keep the main app installable through requirements.txt; install this file
-# only in an environment that has enough build/install budget for PaddleOCR.
-paddlepaddle==3.3.1
-paddleocr==3.3.3
+# Optional local dots.ocr/dots.mocr runtime notes.
+#
+# This app uses dots.ocr through a vLLM OpenAI-compatible endpoint configured
+# with DOTS_OCR_BASE_URL. That is the practical Streamlit Cloud deployment path
+# because dots.ocr/dots.mocr is a GPU VLM, not a small CPU OCR package.
+#
+# Run the model in a separate GPU environment using the upstream instructions:
+# https://github.com/rednote-hilab/dots.ocr
+#
+# Keep Streamlit Cloud on requirements.txt only.

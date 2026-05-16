@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 from dataclasses import dataclass, field
-from importlib.util import find_spec
+from io import BytesIO
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
+
+import requests
+from PIL import Image
 
 from contract_extractor.constants import MIN_TEXT_CHARS_FOR_NATIVE_PAGE
 from contract_extractor.parser import clean_text
+
+
+DOTS_OCR_PROMPT = "Extract the text content from this image."
+DOTS_IMAGE_PREFIX = "<|img|><|imgpad|><|endofimg|>"
 
 
 @dataclass
@@ -27,45 +35,66 @@ class PdfTextExtraction:
         return [(page.page_number, page.text) for page in self.pages]
 
 
-class PaddleOcrEngine:
-    def __init__(self, lang: str = "id") -> None:
-        try:
-            from paddleocr import PaddleOCR
-        except Exception as exc:  # pragma: no cover - only exercised without PaddleOCR installed.
-            raise RuntimeError(
-                "PaddleOCR belum tersedia. Pastikan paddlepaddle dan paddleocr "
-                "terpasang sesuai requirements.txt."
-            ) from exc
+class DotsOcrEngine:
+    """Client for a dots.ocr/dots.mocr vLLM OpenAI-compatible endpoint."""
 
-        self.lang = lang
-        try:
-            self._ocr = PaddleOCR(
-                lang=lang,
-                use_doc_orientation_classify=False,
-                use_doc_unwarping=False,
-                use_textline_orientation=False,
-            )
-        except TypeError:
-            # Compatibility fallback for PaddleOCR 2.x style constructors.
-            self._ocr = PaddleOCR(lang=lang, use_angle_cls=True)
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model_name: str = "rednote-hilab/dots.mocr",
+        api_key: str = "0",
+        temperature: float = 0.1,
+        top_p: float = 0.9,
+        max_completion_tokens: int = 16384,
+        timeout_seconds: int = 180,
+    ) -> None:
+        normalized_base_url = base_url.rstrip("/")
+        if not normalized_base_url.endswith("/v1"):
+            normalized_base_url = f"{normalized_base_url}/v1"
+        self.base_url = normalized_base_url
+        self.model_name = model_name
+        self.api_key = api_key or "0"
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_completion_tokens = max_completion_tokens
+        self.timeout_seconds = timeout_seconds
 
     def read_image(self, image_path: str | Path) -> str:
-        path = str(image_path)
-        if hasattr(self._ocr, "predict"):
-            result = self._ocr.predict(path)
-        else:
-            result = self._ocr.ocr(path, cls=True)
-        return "\n".join(_extract_texts_from_paddle_result(result))
-
-
-def paddleocr_available() -> bool:
-    return find_spec("paddleocr") is not None and find_spec("paddle") is not None
+        image_url = _image_file_to_data_url(image_path)
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": f"{DOTS_IMAGE_PREFIX}{DOTS_OCR_PROMPT}"},
+                    ],
+                }
+            ],
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "max_completion_tokens": self.max_completion_tokens,
+        }
+        response = requests.post(
+            f"{self.base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        data = response.json()
+        return clean_text(data["choices"][0]["message"]["content"])
 
 
 def extract_pdf_text(
     pdf_bytes: bytes,
     *,
-    ocr_factory: Callable[[], PaddleOcrEngine] | None = None,
+    ocr_engine: DotsOcrEngine,
     min_native_chars: int = MIN_TEXT_CHARS_FOR_NATIVE_PAGE,
 ) -> PdfTextExtraction:
     try:
@@ -75,10 +104,9 @@ def extract_pdf_text(
 
     warnings: list[str] = []
     pages: list[PageText] = []
-    ocr_engine: PaddleOcrEngine | None = None
 
     with fitz.open(stream=pdf_bytes, filetype="pdf") as document:
-        with tempfile.TemporaryDirectory(prefix="contract-paddleocr-") as tmp_dir:
+        with tempfile.TemporaryDirectory(prefix="contract-dots-ocr-") as tmp_dir:
             tmp_path = Path(tmp_dir)
             for page_index, page in enumerate(document, start=1):
                 native_text = clean_text(page.get_text("text"))
@@ -86,25 +114,18 @@ def extract_pdf_text(
                     pages.append(PageText(page_index, native_text, "native"))
                     continue
 
-                if ocr_factory is None:
-                    warning = f"Halaman {page_index} minim text layer dan OCR tidak tersedia."
-                    warnings.append(warning)
-                    pages.append(PageText(page_index, native_text, "native-empty", [warning]))
-                    continue
-
-                ocr_engine = ocr_engine or ocr_factory()
                 image_path = tmp_path / f"page-{page_index}.png"
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                 pixmap.save(str(image_path))
                 ocr_text = clean_text(ocr_engine.read_image(image_path))
 
                 if not ocr_text:
-                    warning = f"PaddleOCR tidak membaca teks di halaman {page_index}."
+                    warning = f"dots.ocr tidak membaca teks di halaman {page_index}."
                     warnings.append(warning)
-                    pages.append(PageText(page_index, native_text, "paddleocr-empty", [warning]))
+                    pages.append(PageText(page_index, native_text, "dots-ocr-empty", [warning]))
                     continue
 
-                pages.append(PageText(page_index, ocr_text, "paddleocr"))
+                pages.append(PageText(page_index, ocr_text, "dots-ocr"))
 
     if not pages:
         warnings.append("PDF tidak memiliki halaman yang bisa dibaca.")
@@ -112,48 +133,29 @@ def extract_pdf_text(
     return PdfTextExtraction(pages=pages, warnings=warnings)
 
 
-def _extract_texts_from_paddle_result(result: object) -> list[str]:
+def _image_file_to_data_url(image_path: str | Path) -> str:
+    with Image.open(image_path) as image:
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def extract_texts_from_layout_response(response: object) -> list[str]:
     texts: list[str] = []
 
     def walk(node: object) -> None:
-        if node is None:
-            return
-
-        for key in ("rec_texts", "texts", "text"):
-            try:
-                value = node[key]  # type: ignore[index]
-            except Exception:
-                value = None
-            if isinstance(value, str):
-                texts.append(value)
-            elif isinstance(value, Iterable) and not isinstance(value, (bytes, str, dict)):
-                for item in value:
-                    if item is not None:
-                        texts.append(str(item))
-                return
-
         if isinstance(node, dict):
-            for key in ("rec_texts", "texts"):
-                value = node.get(key)
-                if isinstance(value, list):
-                    texts.extend(str(item) for item in value if item is not None)
-                    return
+            text = node.get("text")
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
             for value in node.values():
                 walk(value)
-            return
-
-        if isinstance(node, tuple) and len(node) == 2:
-            second = node[1]
-            if isinstance(second, (tuple, list)) and second and isinstance(second[0], str):
-                texts.append(second[0])
-                return
-
-        if isinstance(node, list):
-            if len(node) == 2 and isinstance(node[1], (tuple, list)) and node[1] and isinstance(node[1][0], str):
-                texts.append(node[1][0])
-                return
+        elif isinstance(node, list):
             for item in node:
                 walk(item)
+        elif isinstance(node, str) and node.strip():
+            texts.append(node.strip())
 
-    walk(result)
-    return [text.strip() for text in texts if str(text).strip()]
+    walk(response)
+    return texts

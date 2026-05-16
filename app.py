@@ -10,7 +10,7 @@ import streamlit as st
 from contract_extractor.constants import APP_NAME, DRIVE_STORAGE_BUCKET, LOCAL_MODEL_NAME, UNIT_OPTIONS
 from contract_extractor.drive_client import DrivePdfFile, GoogleDriveClient
 from contract_extractor.parser import parse_extraction_pages
-from contract_extractor.pdf_ocr import PaddleOcrEngine, extract_pdf_text, paddleocr_available
+from contract_extractor.pdf_ocr import DotsOcrEngine, extract_pdf_text
 from contract_extractor.supabase_repo import SupabaseRepository
 from contract_extractor.ui_style import (
     empty_panel,
@@ -26,6 +26,7 @@ REQUIRED_SECRETS = [
     "SUPABASE_SERVICE_ROLE_KEY",
     "GOOGLE_DRIVE_FOLDER_ID",
     "GOOGLE_SERVICE_ACCOUNT_JSON",
+    "DOTS_OCR_BASE_URL",
 ]
 
 
@@ -57,7 +58,7 @@ def main() -> None:
             ("Dokumen", str(len(documents))),
             ("Needs review", str(sum(1 for doc in documents if doc.get("status") == "needs_review"))),
             ("Approved", str(len(contracts))),
-            ("OCR engine", "PaddleOCR ready" if paddleocr_available() else "Text-only runtime"),
+            ("OCR engine", "dots.ocr"),
         ]
     )
 
@@ -80,9 +81,17 @@ def get_drive_client(service_account_json: str, folder_id: str) -> GoogleDriveCl
     return GoogleDriveClient.from_service_account_json(parse_service_account(service_account_json), folder_id)
 
 
-@st.cache_resource(show_spinner="Memuat PaddleOCR model...")
-def get_ocr_engine() -> PaddleOcrEngine:
-    return PaddleOcrEngine(lang="id")
+@st.cache_resource(show_spinner=False)
+def get_ocr_engine(
+    base_url: str,
+    model_name: str,
+    api_key: str,
+) -> DotsOcrEngine:
+    return DotsOcrEngine(
+        base_url=base_url,
+        model_name=model_name or "rednote-hilab/dots.mocr",
+        api_key=api_key or "0",
+    )
 
 
 def render_drive_intake(
@@ -92,14 +101,10 @@ def render_drive_intake(
 ) -> None:
     section_intro(
         "Drive Intake",
-        "Read PDFs from the shared folder, import only the files you need, then process one document at a time so PaddleOCR stays predictable on Streamlit Cloud.",
+        "Read PDFs from the shared folder, import only the files you need, then process one document at a time through the mandatory dots.ocr fallback.",
         "manual sync",
     )
-    if not paddleocr_available():
-        st.warning(
-            "PaddleOCR belum terpasang di runtime ini. PDF dengan text layer tetap bisa diproses; "
-            "PDF scan akan butuh environment dengan requirements-ocr.txt."
-        )
+    st.caption(f"dots.ocr endpoint: `{secret('DOTS_OCR_BASE_URL').rstrip('/')}/chat/completions`")
 
     col_a, col_b = st.columns([1, 1], vertical_alignment="bottom")
     with col_a:
@@ -416,8 +421,13 @@ def process_document(
     try:
         with st.spinner("Download PDF dari Google Drive..."):
             pdf_bytes = drive.download_pdf(drive_file_id)
-        with st.spinner("Membaca PDF dan menjalankan PaddleOCR bila diperlukan..."):
-            pdf_text = extract_pdf_text(pdf_bytes, ocr_factory=get_ocr_engine)
+        with st.spinner("Membaca PDF dan menjalankan dots.ocr bila diperlukan..."):
+            ocr_engine = get_ocr_engine(
+                secret("DOTS_OCR_BASE_URL"),
+                secret("DOTS_OCR_MODEL") or "rednote-hilab/dots.mocr",
+                secret("DOTS_OCR_API_KEY") or "0",
+            )
+            pdf_text = extract_pdf_text(pdf_bytes, ocr_engine=ocr_engine)
             result = parse_extraction_pages(
                 pdf_text.as_parser_pages(),
                 warnings=pdf_text.warnings,
@@ -428,7 +438,7 @@ def process_document(
             raw_context={
                 "page_count": len(pdf_text.pages),
                 "ocr_pages": [
-                    page.page_number for page in pdf_text.pages if page.method == "paddleocr"
+                    page.page_number for page in pdf_text.pages if page.method == "dots-ocr"
                 ],
                 "methods": [page.method for page in pdf_text.pages],
             },
@@ -503,6 +513,9 @@ def render_missing_config(missing: list[str]) -> None:
                 'SUPABASE_SERVICE_ROLE_KEY = "..."',
                 'GOOGLE_DRIVE_FOLDER_ID = "..."',
                 'GOOGLE_SERVICE_ACCOUNT_JSON = """{...}"""',
+                'DOTS_OCR_BASE_URL = "https://your-dots-ocr-vllm-host/v1"',
+                'DOTS_OCR_MODEL = "rednote-hilab/dots.mocr"',
+                'DOTS_OCR_API_KEY = "0"',
             ]
         ),
         language="toml",

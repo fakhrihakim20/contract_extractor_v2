@@ -454,7 +454,7 @@ def render_app_header() -> None:
               </div>
               <div class="flow-step" style="--step: 2">
                 <div class="flow-node">02</div>
-                <div><div class="flow-label">PaddleOCR fallback</div><div class="flow-meta">Only for pages without text layer</div></div>
+                <div><div class="flow-label">dots.ocr fallback</div><div class="flow-meta">Only for pages without text layer</div></div>
               </div>
               <div class="flow-step" style="--step: 3">
                 <div class="flow-node">03</div>
