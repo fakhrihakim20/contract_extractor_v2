@@ -27,6 +27,8 @@ Share folder Google Drive sumber PDF ke email `client_email` dari service accoun
 ## Local Run
 
 Python lokal yang direkomendasikan sama dengan Streamlit Cloud, yaitu Python 3.12.
+Saat deploy di Streamlit Community Cloud, pilih Python 3.12 di `Advanced settings`.
+Jika app sudah dibuat dengan versi Python lain, Streamlit mewajibkan delete + redeploy untuk mengganti versi Python.
 
 ```bash
 python -m pip install -r requirements.txt
