@@ -8,7 +8,7 @@ Streamlit app untuk membaca PDF kontrak dari Google Drive, mengekstrak draft met
 - Supabase Python client dengan `SUPABASE_SERVICE_ROLE_KEY` di server-side secrets
 - Google Drive API service account untuk folder PDF private
 - PyMuPDF untuk text-native PDF
-- PaddleOCR untuk fallback OCR halaman scan
+- PaddleOCR untuk fallback OCR halaman scan, dipisah sebagai optional dependency agar app tetap bisa boot di Streamlit Cloud free tier
 - Taste-skill UI theme: premium operations console, `Outfit` + `JetBrains Mono`, matte neutral surfaces, and a single blue-gray accent
 
 ## Secrets
@@ -36,6 +36,21 @@ streamlit run app.py
 ```
 
 PaddleOCR akan mengunduh model OCR saat pertama kali dipakai. PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa memuat PaddleOCR.
+
+## OCR Dependency
+
+`requirements.txt` sengaja dibuat ringan agar Streamlit Cloud tidak gagal saat install.
+Kode OCR tetap memakai PaddleOCR, tetapi dependency beratnya ada di `requirements-ocr.txt`.
+
+Untuk environment yang kuat:
+
+```bash
+python -m pip install -r requirements.txt
+python -m pip install -r requirements-ocr.txt
+```
+
+Di Streamlit Cloud free tier, app tetap bisa import dan memproses PDF text-native tanpa OCR.
+Jika PDF scan memerlukan OCR dan PaddleOCR belum terpasang di runtime, job akan gagal dengan pesan konfigurasi OCR yang eksplisit, bukan membuat seluruh app gagal install.
 
 ## Workflow
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from dataclasses import dataclass, field
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -55,6 +56,10 @@ class PaddleOcrEngine:
         else:
             result = self._ocr.ocr(path, cls=True)
         return "\n".join(_extract_texts_from_paddle_result(result))
+
+
+def paddleocr_available() -> bool:
+    return find_spec("paddleocr") is not None and find_spec("paddle") is not None
 
 
 def extract_pdf_text(

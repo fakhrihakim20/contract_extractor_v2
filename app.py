@@ -10,7 +10,7 @@ import streamlit as st
 from contract_extractor.constants import APP_NAME, DRIVE_STORAGE_BUCKET, LOCAL_MODEL_NAME, UNIT_OPTIONS
 from contract_extractor.drive_client import DrivePdfFile, GoogleDriveClient
 from contract_extractor.parser import parse_extraction_pages
-from contract_extractor.pdf_ocr import PaddleOcrEngine, extract_pdf_text
+from contract_extractor.pdf_ocr import PaddleOcrEngine, extract_pdf_text, paddleocr_available
 from contract_extractor.supabase_repo import SupabaseRepository
 from contract_extractor.ui_style import (
     empty_panel,
@@ -57,7 +57,7 @@ def main() -> None:
             ("Dokumen", str(len(documents))),
             ("Needs review", str(sum(1 for doc in documents if doc.get("status") == "needs_review"))),
             ("Approved", str(len(contracts))),
-            ("OCR engine", "PaddleOCR"),
+            ("OCR engine", "PaddleOCR ready" if paddleocr_available() else "Text-only runtime"),
         ]
     )
 
@@ -95,6 +95,11 @@ def render_drive_intake(
         "Read PDFs from the shared folder, import only the files you need, then process one document at a time so PaddleOCR stays predictable on Streamlit Cloud.",
         "manual sync",
     )
+    if not paddleocr_available():
+        st.warning(
+            "PaddleOCR belum terpasang di runtime ini. PDF dengan text layer tetap bisa diproses; "
+            "PDF scan akan butuh environment dengan requirements-ocr.txt."
+        )
 
     col_a, col_b = st.columns([1, 1], vertical_alignment="bottom")
     with col_a:
