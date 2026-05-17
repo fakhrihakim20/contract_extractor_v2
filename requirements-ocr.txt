@@ -1,10 +1,6 @@
-# Optional local dots.ocr/dots.mocr runtime notes.
+# OCR is now installed through requirements.txt.
 #
-# This app uses dots.ocr through a vLLM OpenAI-compatible endpoint configured
-# with DOTS_OCR_BASE_URL. That is the practical Streamlit Cloud deployment path
-# because dots.ocr/dots.mocr is a GPU VLM, not a small CPU OCR package.
-#
-# Run the model in a separate GPU environment using the upstream instructions:
-# https://github.com/rednote-hilab/dots.ocr
-#
-# Keep Streamlit Cloud on requirements.txt only.
+# The app uses RapidOCR with ONNXRuntime locally inside Streamlit Cloud.
+# Keep this file only as a note for operators who previously configured
+# external dots.ocr/PaddleOCR runtimes; those secrets and services are no
+# longer required.

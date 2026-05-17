@@ -7,3 +7,8 @@ google-api-python-client==2.187.0
 google-auth==2.43.0
 numpy==2.2.6
 requests==2.34.2
+rapidocr==3.8.1
+onnxruntime==1.24.1
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3
+opencv-python==4.13.0.92

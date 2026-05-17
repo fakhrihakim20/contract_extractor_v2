@@ -8,7 +8,7 @@ Streamlit app untuk membaca PDF kontrak dari Google Drive, mengekstrak draft met
 - Supabase Python client dengan `SUPABASE_SERVICE_ROLE_KEY` di server-side secrets
 - Google Drive API service account untuk folder PDF private
 - PyMuPDF untuk text-native PDF
-- dots.ocr/dots.mocr untuk fallback OCR halaman scan via vLLM OpenAI-compatible endpoint
+- RapidOCR + ONNXRuntime untuk fallback OCR halaman scan di CPU Streamlit
 - Taste-skill UI theme: premium operations console, `Outfit` + `JetBrains Mono`, matte neutral surfaces, and a single blue-gray accent
 
 ## Secrets
@@ -20,9 +20,6 @@ SUPABASE_URL = "https://cxretrzlhzsijiegyiwl.supabase.co"
 SUPABASE_SERVICE_ROLE_KEY = "replace-with-service-role-key"
 GOOGLE_DRIVE_FOLDER_ID = "replace-with-folder-id"
 GOOGLE_SERVICE_ACCOUNT_JSON = """{"type":"service_account", "...":"..."}"""
-DOTS_OCR_BASE_URL = "https://your-dots-ocr-vllm-host/v1"
-DOTS_OCR_MODEL = "rednote-hilab/dots.mocr"
-DOTS_OCR_API_KEY = "0"
 ```
 
 Share folder Google Drive sumber PDF ke email `client_email` dari service account.
@@ -38,20 +35,14 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-dots.ocr berjalan sebagai service terpisah. PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa memanggil endpoint OCR; halaman scan akan dirender sebagai PNG dan dikirim ke `DOTS_OCR_BASE_URL`.
+PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa OCR. Halaman scan akan dirender satu per satu lalu dibaca lokal dengan RapidOCR ONNXRuntime.
 
-## dots.ocr Runtime
+## RapidOCR Runtime
 
-`requirements.txt` sengaja dibuat ringan agar Streamlit Cloud tidak gagal saat install.
-Kode OCR wajib memakai dots.ocr/dots.mocr, tetapi modelnya harus berjalan di environment GPU terpisah sebagai vLLM OpenAI-compatible server.
+`requirements.txt` memasang `rapidocr` dan `onnxruntime`, jadi tidak perlu API OCR eksternal.
+Streamlit Community Cloud tetap memiliki resource terbatas; proses scan besar dibuat satu dokumen per aksi dan satu halaman per iterasi.
 
-Contoh target endpoint yang dipakai app:
-
-```text
-POST {DOTS_OCR_BASE_URL}/chat/completions
-```
-
-Gunakan upstream `rednote-hilab/dots.ocr` untuk menjalankan model di server GPU, lalu isi `DOTS_OCR_BASE_URL`, `DOTS_OCR_MODEL`, dan `DOTS_OCR_API_KEY` di Streamlit secrets.
+Jika build Cloud gagal karena wheel Python, deploy ulang dengan Python 3.12 dari Advanced settings Streamlit.
 
 ## Workflow
 
@@ -66,7 +57,7 @@ Tidak ada migrasi awal. App memakai tabel lama:
 
 - `documents.storage_bucket = "google-drive"`
 - `documents.storage_path = "gdrive:<drive_file_id>"`
-- `extraction_jobs.model = "dots-mocr-vllm-regex-v1"`
+- `extraction_jobs.model = "rapidocr-onnxruntime-v1"`
 - Draft disimpan ke `contract_extraction_drafts` dan `boq_extraction_draft_items`
 - Approval tetap lewat `approve_contract_document`
 
@@ -78,3 +69,15 @@ Pastikan tabel dan RPC tersebut masih exposed di Supabase Data API. Project lama
 python -m unittest discover -s tests
 python -m compileall app.py contract_extractor tests
 ```
+
+## Benchmark Sample
+
+PDF contoh `018 PJ Peremajaan GSW untuk Perbaikan sistem Pengamanan Petir.pdf`:
+
+- Ukuran: 19.175 MB
+- Halaman: 37
+- Text layer native: 0 karakter
+- RapidOCR 2x render CPU lokal: 37/37 halaman sukses, 0 kosong, 0 error
+- Total OCR: 566.449 detik
+- Rata-rata: 15.309 detik/halaman
+- Rentang halaman: 7.901-29.085 detik
