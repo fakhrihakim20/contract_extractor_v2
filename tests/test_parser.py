@@ -29,6 +29,8 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(format_date_iso("16 Mei 2026"), "2026-05-16")
         self.assertEqual(format_date_iso("16/05/2026"), "2026-05-16")
         self.assertEqual(format_date_iso("2026-05-16"), "2026-05-16")
+        self.assertEqual(format_date_iso("130ktober2025"), "2025-10-13")
+        self.assertEqual(format_date_iso("13 Okdober 2025"), "2025-10-13")
         self.assertIsNone(format_date_iso("31/02/2026"))
 
     def test_normalize_unit_name(self) -> None:
@@ -57,6 +59,27 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(metadata.vendor_name, "PT Contoh Energi Nusantara")
         self.assertEqual(metadata.unit_name, "UPT Surabaya")
 
+    def test_parse_metadata_from_rapidocr_cover_text(self) -> None:
+        metadata = parse_contract_metadata(
+            """
+            PT.PLN (Persero)
+            UNITINDUKTRANSMISIJAWABAGIANTIMURDANBALI
+            UNITPELAKSANATRANSMISISURABAYA
+            SURATPERJANJIAN
+            Nomor ：018.PJ/DAN.01.03/F34050000/2025
+            Tanggal :130ktober2025
+            Perihal :PeremajaanGswuntukperbaikansistem
+            pengaman Petir diUPT Surabaya
+            NoSKI 2025.TJTB.4.003
+            Perusahaan PTCITAYASAPERDANA
+            """
+        )
+        self.assertEqual(metadata.contract_number, "018.PJ/DAN.01.03/F34050000/2025")
+        self.assertEqual(metadata.contract_date, "2025-10-13")
+        self.assertEqual(metadata.contract_year, 2025)
+        self.assertEqual(metadata.vendor_name, "PT CITA YASA PERDANA")
+        self.assertEqual(metadata.unit_name, "UPT Surabaya")
+
     def test_parse_boq_items_multiline(self) -> None:
         items = parse_boq_items(
             """
@@ -74,6 +97,42 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(items[0].material_unit_price, 1200000.0)
         self.assertEqual(items[0].service_unit_price, 350000.0)
         self.assertEqual(items[0].source_page, 3)
+
+    def test_parse_boq_items_from_rapidocr_table(self) -> None:
+        items = parse_boq_items(
+            """
+            BILLof QUANTITY
+            M URAIAN PEKERJAAN VOLUME HARGA SATUAN JUMLAH HARGA
+            1 Material
+            1 AS55mm 41.679.230meler 21.975 915.918.792 915.918.792
+            2 ShockDumperAS55mm 90.000bh 387.754 34.897.883 34.897.883
+            5 Dead end singletension(deadend press)galvanizedAS55mm 46.000bh 1.114.526 51.268.173 51.268.173
+            II Jasa
+            1 Bongkardanpasang GSW(include sagging) 41.679.230meter 15.902 662.770.611 662.770.611
+            4 Pengangkutanmaterial dari gudangPLN UPTkelokasi 1,000ls 62.606.800 62.606.800 62.606.800
+            """,
+            source_page=37,
+        )
+        self.assertEqual(len(items), 5)
+        self.assertEqual(items[0].description, "AS55mm")
+        self.assertEqual(items[0].unit, "meter")
+        self.assertEqual(items[0].material_unit_price, 21975.0)
+        self.assertIsNone(items[0].service_unit_price)
+        self.assertEqual(items[3].description, "Bongkar dan pasang GSW(include sagging)")
+        self.assertEqual(items[3].service_unit_price, 15902.0)
+        self.assertEqual(items[4].unit, "ls")
+        self.assertEqual(items[4].service_unit_price, 62606800.0)
+
+    def test_parse_extraction_ignores_numbered_contract_clauses(self) -> None:
+        items = parse_boq_items(
+            """
+            8) Berita Acara Penyerahan Akhir adalah berita acara yang dibuat untuk menyatakan hak.
+            9) Gambar-gambar apabila ada.
+            10) Daftar kuantitas dan harga.
+            PASAL 3 LINGKUP PEKERJAAN
+            """
+        )
+        self.assertEqual(items, [])
 
     def test_parse_extraction_pages_with_no_boq(self) -> None:
         result = parse_extraction_pages(

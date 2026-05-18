@@ -81,3 +81,4 @@ PDF contoh `018 PJ Peremajaan GSW untuk Perbaikan sistem Pengamanan Petir.pdf`:
 - Total OCR: 566.449 detik
 - Rata-rata: 15.309 detik/halaman
 - Rentang halaman: 7.901-29.085 detik
+- Parser v2 mengenali metadata sampel sebagai `018.PJ/DAN.01.03/F34050000/2025`, tanggal `2025-10-13`, vendor `PT CITA YASA PERDANA`, unit `UPT Surabaya`, dan 16 baris BoQ dari lampiran.

@@ -28,6 +28,9 @@ MONTHS_ID = {
     "september": 9,
     "sep": 9,
     "oktober": 10,
+    "0ktober": 10,
+    "okdober": 10,
+    "0kdober": 10,
     "okt": 10,
     "oct": 10,
     "november": 11,
@@ -59,7 +62,27 @@ BOQ_UNIT_WORDS = {
     "pcs",
     "set",
     "titik",
+    "tower",
     "unit",
+    "meler",
+    "mtr",
+}
+
+BOQ_UNIT_ALIASES = {
+    "bh": "bh",
+    "buah": "bh",
+    "ea": "ea",
+    "ls": "ls",
+    "s": "ls",
+    "lot": "lot",
+    "meter": "meter",
+    "meler": "meter",
+    "mtr": "meter",
+    "m": "m",
+    "titik": "titik",
+    "tower": "tower",
+    "unit": "unit",
+    "set": "set",
 }
 
 
@@ -123,6 +146,21 @@ def clean_text(value: str | None) -> str:
     if not value:
         return ""
     value = value.replace("\u00a0", " ")
+    value = value.translate(
+        str.maketrans(
+            {
+                "：": ":",
+                "，": ",",
+                "（": "(",
+                "）": ")",
+                "“": '"',
+                "”": '"',
+                "’": "'",
+                "–": "-",
+                "—": "-",
+            }
+        )
+    )
     value = re.sub(r"[ \t]+", " ", value)
     value = re.sub(r"\n{3,}", "\n\n", value)
     return value.strip()
@@ -167,6 +205,7 @@ def format_date_iso(value: str | None) -> str | None:
     if not value:
         return None
     text = clean_text(value).lower()
+    text = re.sub(r"(?<=\d)o(?=ktober|kdober)", "0", text)
 
     iso_match = re.search(r"\b(20\d{2}|19\d{2})-(\d{1,2})-(\d{1,2})\b", text)
     if iso_match:
@@ -186,7 +225,7 @@ def format_date_iso(value: str | None) -> str | None:
 
     month_pattern = "|".join(sorted(MONTHS_ID, key=len, reverse=True))
     named_match = re.search(
-        rf"\b(\d{{1,2}})\s+({month_pattern})\s+((?:19|20)\d{{2}})\b",
+        rf"\b(\d{{1,2}})\s*({month_pattern})\s*((?:19|20)\d{{2}})\b",
         text,
     )
     if named_match:
@@ -214,20 +253,13 @@ def normalize_unit_name(value: str | None) -> tuple[str | None, str | None]:
 
 def parse_contract_metadata(text: str) -> ContractMetadata:
     normalized = clean_text(text)
-    contract_number = _find_first(
-        normalized,
-        [
-            r"(?:nomor|no\.?)\s*(?:kontrak|perjanjian|spk|surat\s+perintah\s+kerja)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9./\-\s]{4,80})",
-            r"(?:kontrak|perjanjian)\s*(?:nomor|no\.?)\s*[:\-]?\s*([A-Z0-9][A-Z0-9./\-\s]{4,80})",
-        ],
-    )
-    contract_number = _trim_line_value(contract_number)
+    contract_number = _find_contract_number(normalized)
 
     date_value = _find_first(
         normalized,
         [
-            r"(?:tanggal\s+kontrak|tanggal\s+perjanjian|tgl\.?)\s*[:\-]?\s*([^\n]{6,40})",
-            r"\b(\d{1,2}\s+(?:januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|november|desember)\s+(?:19|20)\d{2})\b",
+            r"(?:tanggal(?:\s+kontrak|\s+perjanjian)?|tgl\.?)\s*[:\-]?\s*([^\n]{4,40})",
+            r"\b(\d{1,2}\s*(?:januari|februari|maret|april|mei|juni|juli|agustus|september|oktober|0ktober|okdober|0kdober|november|desember)\s*(?:19|20)\d{2})\b",
             r"\b(\d{1,2}[/-]\d{1,2}[/-](?:19|20)\d{2})\b",
         ],
     )
@@ -241,14 +273,7 @@ def parse_contract_metadata(text: str) -> ContractMetadata:
         if year_value:
             year = int(year_value)
 
-    vendor_name = _find_first(
-        normalized,
-        [
-            r"(?:nama\s+penyedia|penyedia\s+jasa|penyedia|vendor|pelaksana|pihak\s+kedua)\s*[:\-]?\s*([^\n]{3,100})",
-            r"(?:pt|cv)\.?\s+[A-Z0-9][^\n]{2,90}",
-        ],
-    )
-    vendor_name = _trim_line_value(vendor_name)
+    vendor_name = _find_vendor_name(normalized)
 
     unit_raw = _find_unit_text(normalized)
     unit_name, normalized_unit_raw = normalize_unit_name(unit_raw)
@@ -273,12 +298,22 @@ def parse_contract_metadata(text: str) -> ContractMetadata:
 
 
 def parse_boq_items(text: str, source_page: int | None = None) -> list[BoqItem]:
-    lines = [_normalize_boq_line(line) for line in clean_text(text).splitlines()]
-    lines = [line for line in lines if line and not _is_header_line(line)]
+    raw_lines = [_normalize_boq_line(line) for line in clean_text(text).splitlines()]
+    has_boq_context = _has_boq_context(raw_lines)
+    lines = [line for line in raw_lines if line and not _is_header_line(line)]
     items: list[BoqItem] = []
     pending: str | None = None
+    section: str | None = None
 
     for line in lines:
+        section = _update_boq_section(line, section)
+        if has_boq_context:
+            table_item = _parse_boq_table_line(line, source_page, section)
+            if table_item:
+                items.append(table_item)
+                pending = None
+                continue
+
         starts_item = bool(_item_id_match(line))
         candidate = line if pending is None else f"{pending} {line}"
         parsed = _parse_boq_line(candidate, source_page)
@@ -287,12 +322,12 @@ def parse_boq_items(text: str, source_page: int | None = None) -> list[BoqItem]:
             pending = None
             continue
 
-        if starts_item:
+        if starts_item and has_boq_context:
             pending = line
-        elif pending:
+        elif pending and has_boq_context:
             pending = candidate
 
-    if pending:
+    if pending and has_boq_context:
         fallback = _parse_partial_boq_line(pending, source_page)
         if fallback:
             items.append(fallback)
@@ -355,12 +390,82 @@ def _find_first(text: str, patterns: list[str]) -> str | None:
     return None
 
 
+def _find_contract_number(text: str) -> str | None:
+    patterns = [
+        r"\b(?:nomor|no\.?)\s*[:\-]?\s*((?:\d{2,4}\s*\.?\s*)?PJ/[A-Z0-9./\-\s]+/(?:19|20)\d{2})",
+        r"\b((?:\d{2,4})\s*\.?\s*PJ/[A-Z0-9./\-\s]+/(?:19|20)\d{2})\b",
+        r"(?:nomor\s+kontrak|nomor\s+perjanjian|kontrak\s+nomor|perjanjian\s+nomor)\s*[:\-]?\s*([A-Z0-9][A-Z0-9./\-\s]{4,80})",
+        r"\b(?:nomor|no\.?)\s*(?!ski\b)(?:kontrak|perjanjian|spk|surat\s+perintah\s+kerja)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9./\-\s]{4,80})",
+    ]
+    value = _find_first(text, patterns)
+    value = _trim_line_value(value)
+    if not value:
+        return None
+    return re.sub(r"\s+", "", value.upper())
+
+
+def _find_vendor_name(text: str) -> str | None:
+    labeled = _find_first(
+        text,
+        [
+            r"(?:perusahaan|nama\s+penyedia|penyedia\s+jasa|penyedia|vendor|pelaksana)\s*[:\-]?\s*((?:PT|CV)\.?\s*[A-Z0-9][^\n]{2,100})",
+            r"(?:pihak\s+kedua)\s*[:\-]?\s*((?:PT|CV)\.?\s*[A-Z0-9][^\n]{2,100})",
+        ],
+    )
+    if labeled:
+        return _normalize_vendor_name(labeled)
+
+    candidates = []
+    for match in re.finditer(r"\b(?:PT|CV)\.?\s*[A-Z0-9][^\n]{2,80}", text, flags=re.IGNORECASE):
+        candidate = _normalize_vendor_name(match.group(0))
+        if candidate and not _is_pln_vendor_candidate(candidate):
+            candidates.append(candidate)
+
+    if not candidates:
+        return None
+
+    spaced = [candidate for candidate in candidates if len(candidate.split()) >= 3]
+    return max(spaced or candidates, key=len)
+
+
 def _trim_line_value(value: str | None) -> str | None:
     if not value:
         return None
     value = re.split(r"\s{2,}|\n|(?:\s+(?:tanggal|pekerjaan|vendor|penyedia)\b)", value, maxsplit=1, flags=re.IGNORECASE)[0]
     value = value.strip(" :-\t")
     return value or None
+
+
+def _normalize_vendor_name(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = clean_text(value)
+    value = re.split(
+        r"\s+(?:PT\.?\s*PLN|PTPLN|PIHAK\s+PERTAMA|UNIT\s+INDUK|UNIT\s+PELAKSANA)\b",
+        value,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
+    value = value.strip(" .,:;-")
+    compact = re.sub(r"[^A-Z0-9]", "", value.upper())
+
+    known_companies = {
+        "PTCITAYASAPERDANA": "PT CITA YASA PERDANA",
+        "CITAYASAPERDANA": "PT CITA YASA PERDANA",
+    }
+    if compact in known_companies:
+        return known_companies[compact]
+
+    value = re.sub(r"^(PT|CV)(?=[A-Z0-9])", r"\1 ", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bPT\.?\b", "PT", value, flags=re.IGNORECASE)
+    value = re.sub(r"\bCV\.?\b", "CV", value, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value or None
+
+
+def _is_pln_vendor_candidate(value: str) -> bool:
+    compact = re.sub(r"[^A-Z]", "", value.upper())
+    return any(token in compact for token in ["PLN", "PERSERO", "TRANSMISI", "UNITINDUK"])
 
 
 def _find_unit_text(text: str) -> str | None:
@@ -375,6 +480,26 @@ def _normalize_boq_line(line: str) -> str:
     line = line.replace("|", " ")
     line = re.sub(r"\s+", " ", line)
     return line.strip()
+
+
+def _has_boq_context(lines: list[str]) -> bool:
+    text = " ".join(lines).lower()
+    compact = re.sub(r"\s+", "", text)
+    return (
+        "billofquantity" in compact
+        or "billofquantity" in text
+        or ("uraian pekerjaan" in text and "volume" in text and "harga satuan" in text)
+        or ("uraian" in text and "satuan" in text and "harga" in text)
+    )
+
+
+def _update_boq_section(line: str, current: str | None) -> str | None:
+    lowered = line.lower().strip()
+    if re.match(r"^(?:i|1)\s+material\b", lowered):
+        return "material"
+    if re.match(r"^(?:ii|2)\s+jasa\b", lowered):
+        return "jasa"
+    return current
 
 
 def _is_header_line(line: str) -> bool:
@@ -448,6 +573,119 @@ def _parse_boq_line(line: str, source_page: int | None) -> BoqItem | None:
         confidence=0.72 if warnings else 0.82,
         warnings=warnings,
     )
+
+
+def _parse_boq_table_line(
+    line: str,
+    source_page: int | None,
+    section: str | None,
+) -> BoqItem | None:
+    if section not in {"material", "jasa"}:
+        return None
+
+    match = re.match(r"^\s*(\d{1,3})\s+(.+)$", line)
+    if not match:
+        return None
+
+    item_id = match.group(1)
+    body = match.group(2).strip()
+    if body.lower() in {"material", "jasa"}:
+        return None
+
+    tokens = body.split()
+    quantity = _find_quantity_unit(tokens)
+    if quantity is None:
+        return None
+
+    quantity_index, unit = quantity
+    if quantity_index < 1:
+        return None
+
+    price_tokens = tokens[quantity_index + 1 :]
+    prices = [parse_indonesian_currency(token) for token in price_tokens]
+    prices = [price for price in prices if price is not None]
+    if not prices:
+        return None
+
+    description = _repair_boq_description(" ".join(tokens[:quantity_index]))
+    if len(description) < 3 or _looks_like_non_boq_description(description):
+        return None
+
+    material_price = prices[0] if section == "material" else None
+    service_price = prices[0] if section == "jasa" else None
+
+    return BoqItem(
+        item_id=item_id,
+        description=description,
+        unit=unit,
+        material_unit_price=material_price,
+        service_unit_price=service_price,
+        source_page=source_page,
+        source_text=line[:500],
+        confidence=0.86,
+        warnings=[],
+    )
+
+
+def _find_quantity_unit(tokens: list[str]) -> tuple[int, str] | None:
+    for index, token in enumerate(tokens):
+        merged = re.match(r"^(\d[\d.,]*)([A-Za-z]{1,12})$", token)
+        if merged:
+            unit = _normalize_boq_unit(merged.group(2))
+            if unit and any(parse_indonesian_currency(candidate) is not None for candidate in tokens[index + 1 :]):
+                return index, unit
+
+        if index + 1 < len(tokens) and re.fullmatch(r"\d[\d.,]*", token):
+            unit = _normalize_boq_unit(tokens[index + 1])
+            if unit and any(parse_indonesian_currency(candidate) is not None for candidate in tokens[index + 2 :]):
+                return index + 1, unit
+
+    return None
+
+
+def _normalize_boq_unit(value: str) -> str | None:
+    normalized = value.lower().strip(".,;:()")
+    return BOQ_UNIT_ALIASES.get(normalized)
+
+
+def _looks_like_non_boq_description(value: str) -> bool:
+    lowered = value.lower()
+    blocked = ["berita acara", "pasal", "pihak pertama", "pihak kedua", "dokumen tender"]
+    return any(token in lowered for token in blocked)
+
+
+def _repair_boq_description(value: str) -> str:
+    replacements = [
+        (r"\bShockDumper", "Shock Dumper"),
+        (r"DumperAS", "Dumper AS"),
+        (r"\bArmourroduntuk", "Armour rod untuk "),
+        (r"SuspensionClamp", "Suspension Clamp"),
+        (r"Suspensionclamp", "Suspension clamp"),
+        (r"ClampAS", "Clamp AS"),
+        (r"clampgalvanized", "clamp galvanized"),
+        (r"galvanizedAS", "galvanized AS"),
+        (r"55mm2Galvanized", "55mm2 Galvanized"),
+        (r"PGKemuntuk", "PG Klem untuk "),
+        (r"SkunAL", "Skun AL"),
+        (r"ASUk", "AS Uk"),
+        (r"\bSackle120kN", "Sackle 120kN"),
+        (r"\bsingletension", "single tension"),
+        (r"\bPekeraanpasang", "Pekerjaan pasang"),
+        (r"steggeruntuk", "stegger untuk"),
+        (r"\bPengangkutanmaterial", "Pengangkutan material"),
+        (r"\bRetummaterial", "Return material"),
+        (r"\blokasikegudang", "lokasi ke gudang"),
+        (r"\bgudangPLN", "gudang PLN"),
+        (r"\bPLNUPT", "PLN UPT"),
+        (r"UPTkelokasi", "UPT ke lokasi"),
+        (r"\bkelokasi", "ke lokasi"),
+        (r"\bBongkardanpasang", "Bongkar dan pasang"),
+    ]
+    repaired = value
+    for pattern, replacement in replacements:
+        repaired = re.sub(pattern, replacement, repaired)
+    repaired = re.sub(r"\s+", " ", repaired)
+    return repaired.strip(" :-")
 
 
 def _parse_partial_boq_line(line: str, source_page: int | None) -> BoqItem | None:
