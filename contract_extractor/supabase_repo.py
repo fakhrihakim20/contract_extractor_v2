@@ -270,13 +270,24 @@ class SupabaseRepository:
             self._execute(
                 self._client.table("contract_extraction_drafts")
                 .upsert(row, on_conflict="document_id")
-                .select("*")
                 .execute()
             )
         )
         if not draft:
+            draft = self.get_draft_by_document_id(document_id)
+        if not draft:
             raise RuntimeError("Gagal menyimpan draft kontrak.")
         return draft
+
+    def get_draft_by_document_id(self, document_id: str) -> dict[str, Any] | None:
+        return self._first(
+            self._execute(
+                self._client.table("contract_extraction_drafts")
+                .select("*")
+                .eq("document_id", document_id)
+                .limit(1)
+            )
+        )
 
     def replace_draft_items(
         self,
