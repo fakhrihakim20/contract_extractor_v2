@@ -4,7 +4,12 @@ import unittest
 
 import pandas as pd
 
-from app import selected_drive_files
+from app import (
+    select_all_drive_ids,
+    select_processable_drive_ids,
+    selected_drive_files,
+    selected_ids_from_rows,
+)
 from contract_extractor.constants import MAX_PDF_BYTES
 from contract_extractor.drive_client import DrivePdfFile
 
@@ -34,6 +39,33 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertEqual(selected, [])
         self.assertEqual(skipped, [])
+
+    def test_selected_ids_from_rows_returns_checked_ids(self) -> None:
+        edited = pd.DataFrame(
+            [
+                {"select": True, "drive_id": "a"},
+                {"select": False, "drive_id": "b"},
+                {"select": True, "drive_id": "c"},
+            ]
+        )
+
+        self.assertEqual(selected_ids_from_rows(edited), ["a", "c"])
+
+    def test_select_all_drive_ids_returns_all_visible_files(self) -> None:
+        files = [
+            DrivePdfFile("a", "a.pdf", 1),
+            DrivePdfFile("b", "b.pdf", MAX_PDF_BYTES + 1),
+        ]
+
+        self.assertEqual(select_all_drive_ids(files), ["a", "b"])
+
+    def test_select_processable_drive_ids_excludes_large_files(self) -> None:
+        files = [
+            DrivePdfFile("a", "a.pdf", MAX_PDF_BYTES),
+            DrivePdfFile("b", "b.pdf", MAX_PDF_BYTES + 1),
+        ]
+
+        self.assertEqual(select_processable_drive_ids(files), ["a"])
 
 
 if __name__ == "__main__":

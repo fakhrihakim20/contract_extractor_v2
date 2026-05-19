@@ -138,7 +138,8 @@ def render_drive_intake(
     existing_by_path = {doc.get("storage_path"): doc for doc in documents}
 
     if files:
-        rows = drive_selection_rows(files, existing_by_path, repo)
+        selected_ids = set(st.session_state.get("drive_selected_ids", []))
+        rows = drive_selection_rows(files, existing_by_path, repo, selected_ids)
         editor_key = f"drive_file_selection_{st.session_state.get('drive_selection_version', 0)}"
         edited = st.data_editor(
             pd.DataFrame(rows),
@@ -165,13 +166,37 @@ def render_drive_intake(
                 "drive_id": st.column_config.TextColumn("Drive ID"),
             },
         )
+        st.session_state["drive_selected_ids"] = selected_ids_from_rows(edited)
         selected_files, skipped_files = selected_drive_files(edited, files)
         if skipped_files:
             st.warning(
                 f"{len(skipped_files)} selected PDF lebih besar dari 50 MB dan akan dilewati."
             )
 
-        action_a, action_b, action_c = st.columns(3)
+        select_a, select_b, select_c = st.columns(3)
+        with select_a:
+            if st.button("Select all", use_container_width=True):
+                st.session_state["drive_selected_ids"] = select_all_drive_ids(files)
+                st.session_state["drive_selection_version"] = (
+                    st.session_state.get("drive_selection_version", 0) + 1
+                )
+                st.rerun()
+        with select_b:
+            if st.button("Select processable only", use_container_width=True):
+                st.session_state["drive_selected_ids"] = select_processable_drive_ids(files)
+                st.session_state["drive_selection_version"] = (
+                    st.session_state.get("drive_selection_version", 0) + 1
+                )
+                st.rerun()
+        with select_c:
+            if st.button("Clear selection", use_container_width=True):
+                st.session_state["drive_selected_ids"] = []
+                st.session_state["drive_selection_version"] = (
+                    st.session_state.get("drive_selection_version", 0) + 1
+                )
+                st.rerun()
+
+        action_a, action_b = st.columns(2)
         with action_a:
             if st.button(
                 "Import selected",
@@ -193,12 +218,6 @@ def render_drive_intake(
                 render_batch_summary(summary, skipped_files)
                 if not summary["failed"]:
                     st.rerun()
-        with action_c:
-            if st.button("Clear selection", use_container_width=True):
-                st.session_state["drive_selection_version"] = (
-                    st.session_state.get("drive_selection_version", 0) + 1
-                )
-                st.rerun()
     else:
         if sync_stats:
             empty_panel(
@@ -248,13 +267,15 @@ def drive_selection_rows(
     files: list[DrivePdfFile],
     existing_by_path: dict[str, dict[str, Any]],
     repo: SupabaseRepository,
+    selected_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    selected_ids = selected_ids or set()
     rows = []
     for file in files:
         doc = existing_by_path.get(repo.drive_storage_path(file.id))
         rows.append(
             {
-                "select": False,
+                "select": file.id in selected_ids,
                 "folder_path": file.folder_path or "-",
                 "name": file.name,
                 "size_mb": round(file.size / 1024 / 1024, 2),
@@ -267,15 +288,27 @@ def drive_selection_rows(
     return rows
 
 
+def selected_ids_from_rows(edited_rows: pd.DataFrame) -> list[str]:
+    return [
+        str(row["drive_id"])
+        for _index, row in edited_rows.iterrows()
+        if bool(row.get("select"))
+    ]
+
+
+def select_all_drive_ids(files: list[DrivePdfFile]) -> list[str]:
+    return [file.id for file in files]
+
+
+def select_processable_drive_ids(files: list[DrivePdfFile]) -> list[str]:
+    return [file.id for file in files if file.size <= MAX_PDF_BYTES]
+
+
 def selected_drive_files(
     edited_rows: pd.DataFrame,
     files: list[DrivePdfFile],
 ) -> tuple[list[DrivePdfFile], list[DrivePdfFile]]:
-    selected_ids = {
-        str(row["drive_id"])
-        for _index, row in edited_rows.iterrows()
-        if bool(row.get("select"))
-    }
+    selected_ids = set(selected_ids_from_rows(edited_rows))
     by_id = {file.id: file for file in files}
     selected = [by_id[file_id] for file_id in selected_ids if file_id in by_id]
     processable = [file for file in selected if file.size <= MAX_PDF_BYTES]
