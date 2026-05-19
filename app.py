@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +18,7 @@ from contract_extractor.constants import (
 from contract_extractor.drive_client import DrivePdfFile, GoogleDriveClient
 from contract_extractor.parser import parse_extraction_pages
 from contract_extractor.pdf_ocr import RapidOcrEngine, extract_pdf_text
-from contract_extractor.supabase_repo import SupabaseRepository
+from contract_extractor.supabase_repo import SupabaseRepository, document_pdf_link, drive_pdf_link
 from contract_extractor.ui_style import (
     empty_panel,
     inject_clean_ui,
@@ -34,6 +34,28 @@ REQUIRED_SECRETS = [
     "GOOGLE_DRIVE_FOLDER_ID",
     "GOOGLE_SERVICE_ACCOUNT_JSON",
 ]
+
+DOCUMENT_STATUS_FILTERS = ["All", "Failed", "Processing", "Needs review", "Approved"]
+DOCUMENT_STATUS_VALUES = {
+    "Failed": "failed",
+    "Processing": "processing",
+    "Needs review": "needs_review",
+    "Approved": "approved",
+}
+INFRASTRUCTURE_FAILURE_STAGES = {"ocr", "save_to_supabase"}
+
+
+class ProcessingStageError(RuntimeError):
+    def __init__(
+        self,
+        stage: str,
+        message: Any,
+        *,
+        infrastructure: bool = False,
+    ) -> None:
+        self.stage = stage
+        self.infrastructure = infrastructure
+        super().__init__(format_stage_error(stage, message))
 
 
 def main() -> None:
@@ -92,6 +114,58 @@ def get_ocr_engine() -> RapidOcrEngine:
     return RapidOcrEngine()
 
 
+def new_batch_summary() -> dict[str, list[str]]:
+    return {"imported": [], "processed": [], "failed": [], "stopped": []}
+
+
+def format_stage_error(stage: str, message: Any) -> str:
+    text = str(message).strip() or "Unknown error"
+    if text.startswith(f"[{stage}]"):
+        return text
+    return f"[{stage}] {text}"
+
+
+def is_infrastructure_failure(exc: Exception) -> bool:
+    if isinstance(exc, ProcessingStageError):
+        return exc.infrastructure or exc.stage in INFRASTRUCTURE_FAILURE_STAGES
+    return False
+
+
+def ocr_preflight_summary(preflight: Callable[[], None]) -> dict[str, list[str]] | None:
+    try:
+        preflight()
+    except ProcessingStageError as exc:
+        summary = new_batch_summary()
+        summary["stopped"].append(str(exc))
+        return summary
+    except Exception as exc:
+        summary = new_batch_summary()
+        summary["stopped"].append(
+            str(ProcessingStageError("ocr", f"OCR runtime preflight gagal: {exc}", infrastructure=True))
+        )
+        return summary
+    return None
+
+
+def preflight_ocr_runtime() -> None:
+    try:
+        import fitz  # noqa: F401
+    except Exception as exc:
+        raise ProcessingStageError(
+            "pdf_read",
+            f"PyMuPDF runtime tidak siap: {exc}",
+            infrastructure=True,
+        ) from exc
+    try:
+        get_ocr_engine()
+    except Exception as exc:
+        raise ProcessingStageError(
+            "ocr",
+            f"RapidOCR runtime tidak siap: {exc}",
+            infrastructure=True,
+        ) from exc
+
+
 def render_drive_intake(
     repo: SupabaseRepository,
     drive: GoogleDriveClient,
@@ -123,6 +197,7 @@ def render_drive_intake(
                         "visited_folders": sync_result.visited_folders,
                         "followed_shortcuts": sync_result.followed_shortcuts,
                     }
+                    st.session_state["drive_pdf_link_backfill_pending"] = True
     with col_b:
         st.caption(f"Model ekstraksi: `{LOCAL_MODEL_NAME}`")
 
@@ -136,6 +211,15 @@ def render_drive_intake(
             f"{sync_stats['followed_shortcuts']} shortcut."
         )
     existing_by_path = {doc.get("storage_path"): doc for doc in documents}
+    if files and st.session_state.get("drive_pdf_link_backfill_pending"):
+        try:
+            backfilled = backfill_drive_pdf_links(repo, files, existing_by_path)
+        except Exception as exc:
+            st.warning(f"Backfill PDF link gagal: {exc}")
+        else:
+            if backfilled:
+                st.caption(f"Backfilled PDF link untuk {backfilled} dokumen existing.")
+            st.session_state["drive_pdf_link_backfill_pending"] = False
 
     if files:
         selected_ids = set(st.session_state.get("drive_selected_ids", []))
@@ -243,24 +327,98 @@ def render_drive_intake(
         empty_panel("Belum ada dokumen", "Import PDF dari daftar Drive untuk mulai membuat draft.")
         return
 
-    st.dataframe(document_summary_frame(drive_documents), use_container_width=True, hide_index=True)
-    selected_doc = st.selectbox(
-        "Reprocess dokumen",
-        drive_documents,
-        format_func=format_document_label,
-        key="intake_reprocess_doc",
+    status_filter = st.radio(
+        "Filter status",
+        DOCUMENT_STATUS_FILTERS,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="drive_document_status_filter",
     )
-    if st.button("Reprocess selected", use_container_width=True):
-        drive_file_id = repo.drive_id_from_storage_path(selected_doc.get("storage_path"))
-        if not drive_file_id:
-            st.error("Dokumen ini tidak memiliki Drive file id.")
-            return
-        try:
-            process_document(repo, drive, selected_doc["id"], drive_file_id)
-            st.success("Reprocess selesai. Draft terbaru siap direview.")
+    visible_documents = filter_documents_by_status(drive_documents, status_filter)
+    if not visible_documents:
+        empty_panel("Tidak ada dokumen", f"Tidak ada dokumen dengan filter {status_filter}.")
+        return
+
+    selected_document_ids = set(st.session_state.get("document_selected_ids", []))
+    document_rows = document_selection_rows(visible_documents, selected_document_ids)
+    document_editor_key = f"drive_document_selection_{st.session_state.get('document_selection_version', 0)}"
+    edited_documents = st.data_editor(
+        pd.DataFrame(document_rows),
+        key=document_editor_key,
+        use_container_width=True,
+        hide_index=True,
+        disabled=[
+            "filename",
+            "status",
+            "job",
+            "contract_number",
+            "vendor",
+            "unit",
+            "size_mb",
+            "pdf_link",
+            "error",
+            "created_at",
+            "document_id",
+        ],
+        column_config={
+            "select": st.column_config.CheckboxColumn("Select", default=False),
+            "filename": st.column_config.TextColumn("Filename", width="large"),
+            "status": st.column_config.TextColumn("Status"),
+            "job": st.column_config.TextColumn("Job"),
+            "contract_number": st.column_config.TextColumn("Contract"),
+            "vendor": st.column_config.TextColumn("Vendor"),
+            "unit": st.column_config.TextColumn("Unit"),
+            "size_mb": st.column_config.NumberColumn("MB", format="%.2f"),
+            "pdf_link": st.column_config.LinkColumn("PDF", display_text="Open"),
+            "error": st.column_config.TextColumn("Error", width="large"),
+            "created_at": st.column_config.TextColumn("Created"),
+            "document_id": st.column_config.TextColumn("Document ID"),
+        },
+    )
+    st.session_state["document_selected_ids"] = selected_document_ids_from_rows(edited_documents)
+    selected_documents = selected_documents_from_rows(edited_documents, visible_documents)
+    selected_failed_documents = [
+        document for document in selected_documents if document.get("status") == "failed"
+    ]
+
+    doc_action_a, doc_action_b, doc_action_c = st.columns(3)
+    with doc_action_a:
+        if st.button(
+            "Reprocess selected",
+            use_container_width=True,
+            disabled=not selected_documents,
+        ):
+            summary = process_imported_documents(repo, drive, selected_documents)
+            render_batch_summary(summary, [])
+            if not summary["failed"] and not summary.get("stopped"):
+                st.rerun()
+    with doc_action_b:
+        if st.button(
+            "Retry failed selected",
+            type="primary",
+            use_container_width=True,
+            disabled=not selected_failed_documents,
+        ):
+            summary = process_imported_documents(repo, drive, selected_failed_documents)
+            render_batch_summary(summary, [])
+            if not summary["failed"] and not summary.get("stopped"):
+                st.rerun()
+    with doc_action_c:
+        if st.button("Clear document selection", use_container_width=True):
+            st.session_state["document_selected_ids"] = []
+            st.session_state["document_selection_version"] = (
+                st.session_state.get("document_selection_version", 0) + 1
+            )
             st.rerun()
-        except Exception as exc:
-            st.error(f"Reprocess gagal: {exc}")
+
+    selected_doc = st.selectbox(
+        "Detail dokumen",
+        visible_documents,
+        format_func=format_document_label,
+        key="intake_detail_doc",
+    )
+    if selected_doc.get("status") == "failed" and selected_doc.get("error_message"):
+        st.error(selected_doc["error_message"])
 
 
 def drive_selection_rows(
@@ -286,6 +444,25 @@ def drive_selection_rows(
             }
         )
     return rows
+
+
+def backfill_drive_pdf_links(
+    repo: SupabaseRepository,
+    files: list[DrivePdfFile],
+    existing_by_path: dict[str, dict[str, Any]],
+) -> int:
+    updated = 0
+    for file in files:
+        document = existing_by_path.get(repo.drive_storage_path(file.id))
+        if not document or document.get("pdf_link"):
+            continue
+        pdf_link = drive_pdf_link(file.id, file.web_view_link)
+        if not pdf_link:
+            continue
+        repo.update_document_pdf_link(document["id"], pdf_link)
+        document["pdf_link"] = pdf_link
+        updated += 1
+    return updated
 
 
 def selected_ids_from_rows(edited_rows: pd.DataFrame) -> list[str]:
@@ -320,7 +497,7 @@ def import_selected_documents(
     repo: SupabaseRepository,
     files: list[DrivePdfFile],
 ) -> dict[str, list[str]]:
-    summary: dict[str, list[str]] = {"imported": [], "processed": [], "failed": []}
+    summary = new_batch_summary()
     progress = st.progress(0, text="Menyiapkan import...")
     total = max(len(files), 1)
 
@@ -341,7 +518,11 @@ def import_and_process_selected(
     drive: GoogleDriveClient,
     files: list[DrivePdfFile],
 ) -> dict[str, list[str]]:
-    summary: dict[str, list[str]] = {"imported": [], "processed": [], "failed": []}
+    preflight_summary = ocr_preflight_summary(preflight_ocr_runtime)
+    if preflight_summary:
+        return preflight_summary
+
+    summary = new_batch_summary()
     progress = st.progress(0, text="Menyiapkan import + process...")
     total = max(len(files), 1)
 
@@ -357,6 +538,42 @@ def import_and_process_selected(
             summary["processed"].append(file.name)
         except Exception as exc:
             summary["failed"].append(f"{file.name}: {exc}")
+            if is_infrastructure_failure(exc):
+                summary["stopped"].append("Batch dihentikan karena error runtime/infrastructure.")
+                break
+
+    progress.empty()
+    return summary
+
+
+def process_imported_documents(
+    repo: SupabaseRepository,
+    drive: GoogleDriveClient,
+    documents: list[dict[str, Any]],
+) -> dict[str, list[str]]:
+    preflight_summary = ocr_preflight_summary(preflight_ocr_runtime)
+    if preflight_summary:
+        return preflight_summary
+
+    summary = new_batch_summary()
+    progress = st.progress(0, text="Menyiapkan reprocess...")
+    total = max(len(documents), 1)
+
+    for index, document in enumerate(documents, start=1):
+        filename = document.get("original_filename") or document.get("id") or "dokumen"
+        progress.progress(index / total, text=f"Reprocess {index}/{len(documents)}: {filename}")
+        drive_file_id = repo.drive_id_from_storage_path(document.get("storage_path"))
+        if not drive_file_id:
+            summary["failed"].append(f"{filename}: Dokumen ini tidak memiliki Drive file id.")
+            continue
+        try:
+            process_document(repo, drive, document["id"], drive_file_id)
+            summary["processed"].append(str(filename))
+        except Exception as exc:
+            summary["failed"].append(f"{filename}: {exc}")
+            if is_infrastructure_failure(exc):
+                summary["stopped"].append("Batch dihentikan karena error runtime/infrastructure.")
+                break
 
     progress.empty()
     return summary
@@ -378,6 +595,8 @@ def render_batch_summary(
         )
     if summary["failed"]:
         st.error("Gagal: " + " | ".join(summary["failed"][:5]))
+    if summary.get("stopped"):
+        st.warning("Stopped: " + " | ".join(summary["stopped"][:3]))
 
 
 def render_review(repo: SupabaseRepository, documents: list[dict[str, Any]]) -> None:
@@ -602,51 +821,121 @@ def process_document(
 ) -> None:
     repo.mark_processing(document_id)
     try:
-        with st.spinner("Download PDF dari Google Drive..."):
-            pdf_bytes = drive.download_pdf(drive_file_id)
-        with st.spinner("Membaca PDF dan menjalankan RapidOCR bila diperlukan..."):
-            ocr_progress = st.progress(0, text="Menyiapkan OCR...")
+        try:
+            with st.spinner("Download PDF dari Google Drive..."):
+                pdf_bytes = drive.download_pdf(drive_file_id)
+        except Exception as exc:
+            raise ProcessingStageError("download", exc) from exc
 
-            def update_ocr_progress(page_number: int, total_pages: int, method: str) -> None:
-                ratio = page_number / max(total_pages, 1)
-                ocr_progress.progress(
-                    min(1.0, ratio),
-                    text=f"Halaman {page_number}/{total_pages}: {method}",
-                )
+        try:
+            with st.spinner("Membaca PDF dan menjalankan RapidOCR bila diperlukan..."):
+                ocr_progress = st.progress(0, text="Menyiapkan OCR...")
 
-            started = time.perf_counter()
-            ocr_engine = get_ocr_engine()
-            pdf_text = extract_pdf_text(
-                pdf_bytes,
-                ocr_engine=ocr_engine,
-                on_page=update_ocr_progress,
-            )
-            elapsed_seconds = time.perf_counter() - started
-            ocr_progress.empty()
+                def update_ocr_progress(page_number: int, total_pages: int, method: str) -> None:
+                    ratio = page_number / max(total_pages, 1)
+                    ocr_progress.progress(
+                        min(1.0, ratio),
+                        text=f"Halaman {page_number}/{total_pages}: {method}",
+                    )
+
+                started = time.perf_counter()
+                try:
+                    ocr_engine = get_ocr_engine()
+                except Exception as exc:
+                    raise ProcessingStageError(
+                        "ocr",
+                        f"RapidOCR runtime tidak siap: {exc}",
+                        infrastructure=True,
+                    ) from exc
+                try:
+                    pdf_text = extract_pdf_text(
+                        pdf_bytes,
+                        ocr_engine=ocr_engine,
+                        on_page=update_ocr_progress,
+                    )
+                except Exception as exc:
+                    raise ProcessingStageError("pdf_read", exc) from exc
+                elapsed_seconds = time.perf_counter() - started
+                ocr_progress.empty()
+        except ProcessingStageError:
+            try:
+                ocr_progress.empty()
+            except Exception:
+                pass
+            raise
+
+        try:
             result = parse_extraction_pages(
                 pdf_text.as_parser_pages(),
                 warnings=pdf_text.warnings,
             )
+        except Exception as exc:
+            raise ProcessingStageError("parser", exc) from exc
+
         ocr_page_count = sum(1 for page in pdf_text.pages if page.method == "rapidocr")
         seconds_per_page = elapsed_seconds / max(len(pdf_text.pages), 1)
-        repo.save_extraction_result(
-            document_id,
-            result,
-            raw_context={
-                "page_count": len(pdf_text.pages),
-                "ocr_pages": [
-                    page.page_number for page in pdf_text.pages if page.method == "rapidocr"
-                ],
-                "ocr_page_count": ocr_page_count,
-                "methods": [page.method for page in pdf_text.pages],
-                "elapsed_seconds": round(elapsed_seconds, 3),
-                "seconds_per_page": round(seconds_per_page, 3),
-                "pdf_size_mb": round(len(pdf_bytes) / 1024 / 1024, 3),
-            },
-        )
+        try:
+            repo.save_extraction_result(
+                document_id,
+                result,
+                raw_context={
+                    "page_count": len(pdf_text.pages),
+                    "ocr_pages": [
+                        page.page_number for page in pdf_text.pages if page.method == "rapidocr"
+                    ],
+                    "ocr_page_count": ocr_page_count,
+                    "methods": [page.method for page in pdf_text.pages],
+                    "elapsed_seconds": round(elapsed_seconds, 3),
+                    "seconds_per_page": round(seconds_per_page, 3),
+                    "pdf_size_mb": round(len(pdf_bytes) / 1024 / 1024, 3),
+                },
+            )
+        except Exception as exc:
+            raise ProcessingStageError("save_to_supabase", exc, infrastructure=True) from exc
     except Exception as exc:
-        repo.mark_failed(document_id, str(exc))
+        try:
+            repo.mark_failed(document_id, str(exc))
+        except Exception:
+            pass
         raise
+
+
+def filter_documents_by_status(
+    documents: list[dict[str, Any]],
+    status_filter: str,
+) -> list[dict[str, Any]]:
+    status = DOCUMENT_STATUS_VALUES.get(status_filter)
+    if not status:
+        return documents
+    return [document for document in documents if document.get("status") == status]
+
+
+def document_selection_rows(
+    documents: list[dict[str, Any]],
+    selected_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    selected_ids = selected_ids or set()
+    rows = []
+    for row in document_summary_frame(documents).to_dict("records"):
+        rows.append({"select": row["document_id"] in selected_ids, **row})
+    return rows
+
+
+def selected_document_ids_from_rows(edited_rows: pd.DataFrame) -> list[str]:
+    return [
+        str(row["document_id"])
+        for _index, row in edited_rows.iterrows()
+        if bool(row.get("select"))
+    ]
+
+
+def selected_documents_from_rows(
+    edited_rows: pd.DataFrame,
+    documents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    selected_ids = set(selected_document_ids_from_rows(edited_rows))
+    by_id = {str(document.get("id")): document for document in documents}
+    return [by_id[document_id] for document_id in selected_ids if document_id in by_id]
 
 
 def document_summary_frame(documents: list[dict[str, Any]]) -> pd.DataFrame:
@@ -663,10 +952,22 @@ def document_summary_frame(documents: list[dict[str, Any]]) -> pd.DataFrame:
                 "vendor": (draft or {}).get("vendor_name"),
                 "unit": (draft or {}).get("unit_name") or (draft or {}).get("unit_raw"),
                 "size_mb": round((doc.get("file_size_bytes") or 0) / 1024 / 1024, 2),
+                "pdf_link": document_pdf_link(doc),
+                "error": shorten_error(doc.get("error_message")),
                 "created_at": doc.get("created_at"),
+                "document_id": doc.get("id"),
             }
         )
     return pd.DataFrame(rows)
+
+
+def shorten_error(message: Any, *, limit: int = 140) -> str | None:
+    if not message:
+        return None
+    text = " ".join(str(message).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
 
 
 def format_document_label(document: dict[str, Any]) -> str:

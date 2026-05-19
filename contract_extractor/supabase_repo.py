@@ -23,27 +23,16 @@ class SupabaseRepository:
             ) from exc
 
         self._client = create_client(url, service_role_key)
+        self._documents_pdf_link_supported = True
 
     def list_documents(self) -> list[dict[str, Any]]:
-        data = self._execute(
-            self._client.table("documents")
-            .select(
-                """
-                id,
-                original_filename,
-                storage_bucket,
-                storage_path,
-                status,
-                file_size_bytes,
-                error_message,
-                created_at,
-                updated_at,
-                extraction_jobs(status, model, completed_at),
-                contract_extraction_drafts(contract_number, vendor_name, unit_name, unit_raw)
-                """
-            )
-            .order("created_at", desc=True)
-        )
+        try:
+            data = self._list_documents(include_pdf_link=self._documents_pdf_link_supported)
+        except Exception as exc:
+            if not _looks_like_missing_pdf_link_column(exc):
+                raise
+            self._documents_pdf_link_supported = False
+            data = self._list_documents(include_pdf_link=False)
         return data or []
 
     def list_contracts(self) -> list[dict[str, Any]]:
@@ -126,9 +115,13 @@ class SupabaseRepository:
         if file.size > MAX_PDF_BYTES:
             raise ValueError(f"{file.name} lebih besar dari batas 50MB.")
 
+        pdf_link = drive_pdf_link(file.id, file.web_view_link)
         existing = self.find_document_by_drive_id(file.id)
         if existing:
             self.ensure_job(existing["id"], status="queued")
+            if pdf_link and not existing.get("pdf_link"):
+                self.update_document_pdf_link(existing["id"], pdf_link)
+                existing["pdf_link"] = pdf_link
             return existing
 
         row = {
@@ -141,13 +134,30 @@ class SupabaseRepository:
             "status": "uploaded",
             "error_message": None,
         }
+        if self._documents_pdf_link_supported:
+            row["pdf_link"] = pdf_link
         document = self._first(
-            self._execute(self._client.table("documents").insert(row).execute())
+            self._insert_document_with_optional_pdf_link(row)
         )
         if not document:
             raise RuntimeError("Gagal membuat dokumen di Supabase.")
         self.ensure_job(document["id"], status="queued")
         return document
+
+    def update_document_pdf_link(self, document_id: str, pdf_link: str | None) -> None:
+        if not pdf_link or not self._documents_pdf_link_supported:
+            return
+        try:
+            self._execute(
+                self._client.table("documents")
+                .update({"pdf_link": pdf_link})
+                .eq("id", document_id)
+                .execute()
+            )
+        except Exception as exc:
+            if not _looks_like_missing_pdf_link_column(exc):
+                raise
+            self._documents_pdf_link_supported = False
 
     def ensure_job(self, document_id: str, *, status: str) -> None:
         self._execute(
@@ -342,6 +352,39 @@ class SupabaseRepository:
             return storage_path.removeprefix("gdrive:")
         return None
 
+    def _list_documents(self, *, include_pdf_link: bool) -> list[dict[str, Any]]:
+        fields = [
+            "id",
+            "original_filename",
+            "storage_bucket",
+            "storage_path",
+            "status",
+            "file_size_bytes",
+            "error_message",
+            "created_at",
+            "updated_at",
+            "extraction_jobs(status, model, completed_at)",
+            "contract_extraction_drafts(contract_number, vendor_name, unit_name, unit_raw)",
+        ]
+        if include_pdf_link:
+            fields.insert(4, "pdf_link")
+        return self._execute(
+            self._client.table("documents")
+            .select(",\n".join(fields))
+            .order("created_at", desc=True)
+        )
+
+    def _insert_document_with_optional_pdf_link(self, row: dict[str, Any]) -> Any:
+        try:
+            return self._execute(self._client.table("documents").insert(row).execute())
+        except Exception as exc:
+            if "pdf_link" not in row or not _looks_like_missing_pdf_link_column(exc):
+                raise
+            self._documents_pdf_link_supported = False
+            fallback_row = dict(row)
+            fallback_row.pop("pdf_link", None)
+            return self._execute(self._client.table("documents").insert(fallback_row).execute())
+
     @staticmethod
     def _first(data: Any) -> dict[str, Any] | None:
         if isinstance(data, list):
@@ -386,3 +429,28 @@ def _is_nan(value: Any) -> bool:
 
 def _utc_now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def drive_pdf_link(file_id: str | None, web_view_link: str | None = None) -> str | None:
+    if web_view_link and web_view_link.strip():
+        return web_view_link.strip()
+    if file_id and file_id.strip():
+        return f"https://drive.google.com/file/d/{file_id.strip()}/view"
+    return None
+
+
+def document_pdf_link(document: dict[str, Any]) -> str | None:
+    explicit = document.get("pdf_link")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip()
+    return drive_pdf_link(SupabaseRepository.drive_id_from_storage_path(document.get("storage_path")))
+
+
+def _looks_like_missing_pdf_link_column(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "pdf_link" in message and (
+        "schema cache" in message
+        or "column" in message
+        or "does not exist" in message
+        or "not found" in message
+    )

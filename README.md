@@ -60,11 +60,15 @@ Tidak ada migrasi awal. App memakai tabel lama:
 
 - `documents.storage_bucket = "google-drive"`
 - `documents.storage_path = "gdrive:<drive_file_id>"`
+- `documents.pdf_link = "<google_drive_web_view_link>"`
 - `extraction_jobs.model = "rapidocr-onnxruntime-v1"`
 - Draft disimpan ke `contract_extraction_drafts` dan `boq_extraction_draft_items`
 - Approval tetap lewat `approve_contract_document`
 
 Pastikan tabel dan RPC tersebut masih exposed di Supabase Data API. Project lama sudah menyiapkan grant/RLS; jika API settings Supabase baru mematikan exposure per tabel/function, aktifkan kembali untuk entitas di atas.
+
+Migration tambahan untuk link PDF ada di `supabase/migrations/20260519073000_add_documents_pdf_link.sql`.
+Jalankan di Supabase sebelum mengandalkan kolom `pdf_link`; app tetap menampilkan fallback link dari `storage_path` kalau migration belum terpasang.
 
 ## Verification
 
