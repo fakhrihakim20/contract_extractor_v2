@@ -47,9 +47,12 @@ Jika build Cloud gagal karena wheel Python, deploy ulang dengan Python 3.12 dari
 ## Workflow
 
 1. `Drive Intake`: klik `Sync Google Drive`, pilih PDF, lalu `Import + Process`.
+   Sync membaca PDF secara rekursif dari folder, subfolder, dan shortcut folder Google Drive.
 2. `Review Draft`: koreksi metadata kontrak dan baris BoQ.
 3. `Approve final`: memanggil RPC Supabase `approve_contract_document`.
 4. `Data Final`: lihat kontrak approved dan download CSV BoQ.
+
+PDF di atas 50 MB tetap tampil di daftar Drive untuk audit, tetapi tidak bisa diimport/process di Streamlit Cloud agar OCR lokal tidak kehabisan resource.
 
 ## Supabase Mapping
 

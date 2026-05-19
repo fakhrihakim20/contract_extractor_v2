@@ -8,7 +8,13 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
-from contract_extractor.constants import APP_NAME, DRIVE_STORAGE_BUCKET, LOCAL_MODEL_NAME, UNIT_OPTIONS
+from contract_extractor.constants import (
+    APP_NAME,
+    DRIVE_STORAGE_BUCKET,
+    LOCAL_MODEL_NAME,
+    MAX_PDF_BYTES,
+    UNIT_OPTIONS,
+)
 from contract_extractor.drive_client import DrivePdfFile, GoogleDriveClient
 from contract_extractor.parser import parse_extraction_pages
 from contract_extractor.pdf_ocr import RapidOcrEngine, extract_pdf_text
@@ -102,11 +108,33 @@ def render_drive_intake(
     with col_a:
         if st.button("Sync Google Drive", type="primary", use_container_width=True):
             with st.spinner("Membaca folder Google Drive..."):
-                st.session_state["drive_files"] = [asdict(file) for file in drive.list_pdfs()]
+                try:
+                    sync_result = drive.sync_pdfs()
+                except Exception as exc:
+                    st.session_state["drive_files"] = []
+                    st.session_state["drive_sync_stats"] = None
+                    st.error(f"Sync Google Drive gagal: {exc}")
+                else:
+                    st.session_state["drive_files"] = [
+                        asdict(file) for file in sync_result.files
+                    ]
+                    st.session_state["drive_sync_stats"] = {
+                        "file_count": len(sync_result.files),
+                        "visited_folders": sync_result.visited_folders,
+                        "followed_shortcuts": sync_result.followed_shortcuts,
+                    }
     with col_b:
         st.caption(f"Model ekstraksi: `{LOCAL_MODEL_NAME}`")
 
     files = [DrivePdfFile(**item) for item in st.session_state.get("drive_files", [])]
+    sync_stats = st.session_state.get("drive_sync_stats")
+    if sync_stats:
+        st.caption(
+            "Sync result: "
+            f"{sync_stats['file_count']} PDF, "
+            f"{sync_stats['visited_folders']} folder, "
+            f"{sync_stats['followed_shortcuts']} shortcut."
+        )
     existing_by_path = {doc.get("storage_path"): doc for doc in documents}
 
     if files:
@@ -116,7 +144,9 @@ def render_drive_intake(
             rows.append(
                 {
                     "name": file.name,
+                    "folder_path": file.folder_path or "-",
                     "size_mb": round(file.size / 1024 / 1024, 2),
+                    "processable": file.size <= MAX_PDF_BYTES,
                     "modified_time": file.modified_time,
                     "status": doc.get("status") if doc else "not_imported",
                     "drive_id": file.id,
@@ -127,11 +157,24 @@ def render_drive_intake(
         selected = st.selectbox(
             "PDF Drive",
             files,
-            format_func=lambda file: f"{file.name} ({file.size / 1024 / 1024:.2f} MB)",
+            format_func=lambda file: (
+                f"{file.folder_path + ' / ' if file.folder_path else ''}"
+                f"{file.name} ({file.size / 1024 / 1024:.2f} MB)"
+            ),
         )
+        selected_too_large = selected.size > MAX_PDF_BYTES
+        if selected_too_large:
+            st.warning(
+                "PDF ini lebih besar dari 50 MB. File tetap ditampilkan untuk audit, "
+                "tetapi tidak bisa di-import/process di Streamlit Cloud agar OCR lokal tidak crash."
+            )
         action_a, action_b, action_c = st.columns(3)
         with action_a:
-            if st.button("Import", use_container_width=True):
+            if st.button(
+                "Import",
+                use_container_width=True,
+                disabled=selected_too_large,
+            ):
                 try:
                     repo.import_drive_file(selected)
                     st.success("Dokumen berhasil diimport.")
@@ -139,7 +182,12 @@ def render_drive_intake(
                 except Exception as exc:
                     st.error(f"Import gagal: {exc}")
         with action_b:
-            if st.button("Import + Process", type="primary", use_container_width=True):
+            if st.button(
+                "Import + Process",
+                type="primary",
+                use_container_width=True,
+                disabled=selected_too_large,
+            ):
                 try:
                     document = repo.import_drive_file(selected)
                     process_document(repo, drive, document["id"], selected.id)
@@ -151,10 +199,16 @@ def render_drive_intake(
             if selected.web_view_link:
                 st.link_button("Buka PDF", selected.web_view_link, use_container_width=True)
     else:
-        empty_panel(
-            "Folder belum disync",
-            "Klik Sync Google Drive untuk membaca daftar PDF dari folder service account.",
-        )
+        if sync_stats:
+            empty_panel(
+                "Tidak ada PDF ditemukan",
+                "Folder bisa diakses, tetapi tidak ada PDF dalam batas kedalaman sync. Pastikan folder berisi PDF atau shortcut/subfolder yang dapat dibaca service account.",
+            )
+        else:
+            empty_panel(
+                "Folder belum disync",
+                "Klik Sync Google Drive untuk membaca daftar PDF dari folder service account.",
+            )
 
     st.divider()
     section_intro(

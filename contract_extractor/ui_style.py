@@ -291,22 +291,24 @@ def inject_clean_ui() -> None:
           max-width: 100% !important;
           margin: 0 auto 1.15rem auto !important;
           justify-content: center !important;
-          gap: 6px !important;
-          padding: 8px !important;
+          gap: 4px !important;
+          padding: 4px !important;
           border: 1px solid var(--line) !important;
-          border-radius: 999px !important;
-          background: rgba(255, 255, 255, 0.76) !important;
-          box-shadow: var(--shadow-tight);
+          border-radius: 8px !important;
+          background: rgba(255, 255, 255, 0.82) !important;
+          box-shadow: 0 10px 28px -24px rgba(17, 24, 39, 0.38);
           backdrop-filter: blur(12px) saturate(112%);
           -webkit-backdrop-filter: blur(12px) saturate(112%);
         }
 
         button[data-baseweb="tab"] {
           border: 0 !important;
-          border-radius: 999px !important;
+          border-radius: 6px !important;
           color: var(--muted) !important;
           font-weight: 720 !important;
           box-shadow: none !important;
+          padding: 0.38rem 0.78rem !important;
+          background: transparent !important;
           transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1), background-color 180ms ease, color 180ms ease;
         }
 
@@ -318,6 +320,10 @@ def inject_clean_ui() -> None:
         button[data-baseweb="tab"][aria-selected="true"] * {
           background: var(--accent) !important;
           color: #ffffff !important;
+        }
+
+        button[data-baseweb="tab"][aria-selected="true"] {
+          box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
         }
 
         [data-baseweb="tab-highlight"] {
@@ -366,6 +372,23 @@ def inject_clean_ui() -> None:
           background: var(--accent) !important;
           color: #ffffff !important;
           border-color: var(--accent) !important;
+        }
+
+        .stButton button[kind="primary"] *,
+        .stButton button[data-testid="baseButton-primary"],
+        .stButton button[data-testid="baseButton-primary"] *,
+        button[kind="primary"],
+        button[kind="primary"] * {
+          color: #ffffff !important;
+          fill: #ffffff !important;
+        }
+
+        .stButton button[kind="primary"]:hover,
+        .stButton button[data-testid="baseButton-primary"]:hover,
+        button[kind="primary"]:hover {
+          background: var(--accent-ink) !important;
+          border-color: var(--accent-ink) !important;
+          color: #ffffff !important;
         }
 
         [data-testid="stDataFrame"] {
