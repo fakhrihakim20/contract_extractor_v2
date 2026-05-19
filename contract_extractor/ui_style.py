@@ -496,16 +496,20 @@ def render_app_header() -> None:
 
 
 def metric_strip(items: list[tuple[str, str]]) -> None:
-    cells = "\n".join(
-        f"""
-        <div class="metric-box">
-          <div class="metric-label">{escape(label)}</div>
-          <div class="metric-value">{escape(value)}</div>
-        </div>
-        """
+    cells = "".join(
+        '<div class="metric-box">'
+        f'<div class="metric-label">{escape(label)}</div>'
+        f'<div class="metric-value">{escape(value)}</div>'
+        "</div>"
         for label, value in items
     )
-    st.markdown(f'<div class="metric-strip">{cells}</div>', unsafe_allow_html=True)
+    html = f'<div class="metric-strip">{cells}</div>'
+    if hasattr(st, "html"):
+        st.html(html)
+    else:
+        columns = st.columns(len(items))
+        for column, (label, value) in zip(columns, items):
+            column.metric(label, value)
 
 
 def section_intro(title: str, body: str, badge: str | None = None) -> None:

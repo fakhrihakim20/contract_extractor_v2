@@ -138,66 +138,67 @@ def render_drive_intake(
     existing_by_path = {doc.get("storage_path"): doc for doc in documents}
 
     if files:
-        rows = []
-        for file in files:
-            doc = existing_by_path.get(repo.drive_storage_path(file.id))
-            rows.append(
-                {
-                    "name": file.name,
-                    "folder_path": file.folder_path or "-",
-                    "size_mb": round(file.size / 1024 / 1024, 2),
-                    "processable": file.size <= MAX_PDF_BYTES,
-                    "modified_time": file.modified_time,
-                    "status": doc.get("status") if doc else "not_imported",
-                    "drive_id": file.id,
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        selected = st.selectbox(
-            "PDF Drive",
-            files,
-            format_func=lambda file: (
-                f"{file.folder_path + ' / ' if file.folder_path else ''}"
-                f"{file.name} ({file.size / 1024 / 1024:.2f} MB)"
-            ),
+        rows = drive_selection_rows(files, existing_by_path, repo)
+        editor_key = f"drive_file_selection_{st.session_state.get('drive_selection_version', 0)}"
+        edited = st.data_editor(
+            pd.DataFrame(rows),
+            key=editor_key,
+            use_container_width=True,
+            hide_index=True,
+            disabled=[
+                "folder_path",
+                "name",
+                "size_mb",
+                "processable",
+                "modified_time",
+                "status",
+                "drive_id",
+            ],
+            column_config={
+                "select": st.column_config.CheckboxColumn("Select", default=False),
+                "folder_path": st.column_config.TextColumn("Folder"),
+                "name": st.column_config.TextColumn("PDF"),
+                "size_mb": st.column_config.NumberColumn("MB", format="%.2f"),
+                "processable": st.column_config.CheckboxColumn("Can process"),
+                "modified_time": st.column_config.TextColumn("Modified"),
+                "status": st.column_config.TextColumn("Status"),
+                "drive_id": st.column_config.TextColumn("Drive ID"),
+            },
         )
-        selected_too_large = selected.size > MAX_PDF_BYTES
-        if selected_too_large:
+        selected_files, skipped_files = selected_drive_files(edited, files)
+        if skipped_files:
             st.warning(
-                "PDF ini lebih besar dari 50 MB. File tetap ditampilkan untuk audit, "
-                "tetapi tidak bisa di-import/process di Streamlit Cloud agar OCR lokal tidak crash."
+                f"{len(skipped_files)} selected PDF lebih besar dari 50 MB dan akan dilewati."
             )
+
         action_a, action_b, action_c = st.columns(3)
         with action_a:
             if st.button(
-                "Import",
+                "Import selected",
                 use_container_width=True,
-                disabled=selected_too_large,
+                disabled=not selected_files,
             ):
-                try:
-                    repo.import_drive_file(selected)
-                    st.success("Dokumen berhasil diimport.")
+                summary = import_selected_documents(repo, selected_files)
+                render_batch_summary(summary, skipped_files)
+                if not summary["failed"]:
                     st.rerun()
-                except Exception as exc:
-                    st.error(f"Import gagal: {exc}")
         with action_b:
             if st.button(
-                "Import + Process",
+                "Import + Process selected",
                 type="primary",
                 use_container_width=True,
-                disabled=selected_too_large,
+                disabled=not selected_files,
             ):
-                try:
-                    document = repo.import_drive_file(selected)
-                    process_document(repo, drive, document["id"], selected.id)
-                    st.success("Draft ekstraksi siap direview.")
+                summary = import_and_process_selected(repo, drive, selected_files)
+                render_batch_summary(summary, skipped_files)
+                if not summary["failed"]:
                     st.rerun()
-                except Exception as exc:
-                    st.error(f"Proses gagal: {exc}")
         with action_c:
-            if selected.web_view_link:
-                st.link_button("Buka PDF", selected.web_view_link, use_container_width=True)
+            if st.button("Clear selection", use_container_width=True):
+                st.session_state["drive_selection_version"] = (
+                    st.session_state.get("drive_selection_version", 0) + 1
+                )
+                st.rerun()
     else:
         if sync_stats:
             empty_panel(
@@ -241,6 +242,109 @@ def render_drive_intake(
             st.rerun()
         except Exception as exc:
             st.error(f"Reprocess gagal: {exc}")
+
+
+def drive_selection_rows(
+    files: list[DrivePdfFile],
+    existing_by_path: dict[str, dict[str, Any]],
+    repo: SupabaseRepository,
+) -> list[dict[str, Any]]:
+    rows = []
+    for file in files:
+        doc = existing_by_path.get(repo.drive_storage_path(file.id))
+        rows.append(
+            {
+                "select": False,
+                "folder_path": file.folder_path or "-",
+                "name": file.name,
+                "size_mb": round(file.size / 1024 / 1024, 2),
+                "processable": file.size <= MAX_PDF_BYTES,
+                "modified_time": file.modified_time,
+                "status": doc.get("status") if doc else "not_imported",
+                "drive_id": file.id,
+            }
+        )
+    return rows
+
+
+def selected_drive_files(
+    edited_rows: pd.DataFrame,
+    files: list[DrivePdfFile],
+) -> tuple[list[DrivePdfFile], list[DrivePdfFile]]:
+    selected_ids = {
+        str(row["drive_id"])
+        for _index, row in edited_rows.iterrows()
+        if bool(row.get("select"))
+    }
+    by_id = {file.id: file for file in files}
+    selected = [by_id[file_id] for file_id in selected_ids if file_id in by_id]
+    processable = [file for file in selected if file.size <= MAX_PDF_BYTES]
+    skipped = [file for file in selected if file.size > MAX_PDF_BYTES]
+    return processable, skipped
+
+
+def import_selected_documents(
+    repo: SupabaseRepository,
+    files: list[DrivePdfFile],
+) -> dict[str, list[str]]:
+    summary: dict[str, list[str]] = {"imported": [], "processed": [], "failed": []}
+    progress = st.progress(0, text="Menyiapkan import...")
+    total = max(len(files), 1)
+
+    for index, file in enumerate(files, start=1):
+        progress.progress(index / total, text=f"Import {index}/{len(files)}: {file.name}")
+        try:
+            repo.import_drive_file(file)
+            summary["imported"].append(file.name)
+        except Exception as exc:
+            summary["failed"].append(f"{file.name}: {exc}")
+
+    progress.empty()
+    return summary
+
+
+def import_and_process_selected(
+    repo: SupabaseRepository,
+    drive: GoogleDriveClient,
+    files: list[DrivePdfFile],
+) -> dict[str, list[str]]:
+    summary: dict[str, list[str]] = {"imported": [], "processed": [], "failed": []}
+    progress = st.progress(0, text="Menyiapkan import + process...")
+    total = max(len(files), 1)
+
+    for index, file in enumerate(files, start=1):
+        progress.progress(
+            index / total,
+            text=f"Process {index}/{len(files)}: {file.name}",
+        )
+        try:
+            document = repo.import_drive_file(file)
+            summary["imported"].append(file.name)
+            process_document(repo, drive, document["id"], file.id)
+            summary["processed"].append(file.name)
+        except Exception as exc:
+            summary["failed"].append(f"{file.name}: {exc}")
+
+    progress.empty()
+    return summary
+
+
+def render_batch_summary(
+    summary: dict[str, list[str]],
+    skipped_files: list[DrivePdfFile],
+) -> None:
+    if summary["imported"]:
+        st.success(f"Imported: {len(summary['imported'])} file.")
+    if summary["processed"]:
+        st.success(f"Processed: {len(summary['processed'])} file.")
+    if skipped_files:
+        st.warning(
+            "Skipped karena >50 MB: "
+            + ", ".join(file.name for file in skipped_files[:5])
+            + (" ..." if len(skipped_files) > 5 else "")
+        )
+    if summary["failed"]:
+        st.error("Gagal: " + " | ".join(summary["failed"][:5]))
 
 
 def render_review(repo: SupabaseRepository, documents: list[dict[str, Any]]) -> None:
