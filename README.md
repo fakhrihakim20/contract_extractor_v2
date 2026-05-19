@@ -41,6 +41,7 @@ PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa OCR. Halaman 
 
 `requirements.txt` memasang `rapidocr` dan `onnxruntime`, jadi tidak perlu API OCR eksternal.
 Streamlit Community Cloud tetap memiliki resource terbatas; proses scan besar dibuat satu dokumen per aksi dan satu halaman per iterasi.
+Model ONNX RapidOCR disimpan di folder writable `~/.cache/contract_extractor_v2/rapidocr`, bukan di `site-packages`, agar tidak kena `Permission denied` di Streamlit Cloud. Jika perlu override, set environment variable `RAPIDOCR_MODEL_ROOT`.
 
 Jika build Cloud gagal karena wheel Python, deploy ulang dengan Python 3.12 dari Advanced settings Streamlit.
 

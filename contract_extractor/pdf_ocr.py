@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from contract_extractor.constants import MIN_TEXT_CHARS_FOR_NATIVE_PAGE
@@ -32,7 +35,7 @@ class PdfTextExtraction:
 class RapidOcrEngine:
     """Small wrapper around RapidOCR's ONNXRuntime backend."""
 
-    def __init__(self, backend: Any | None = None) -> None:
+    def __init__(self, backend: Any | None = None, model_root_dir: str | Path | None = None) -> None:
         if backend is None:
             try:
                 from rapidocr import RapidOCR
@@ -40,7 +43,13 @@ class RapidOcrEngine:
                 raise RuntimeError(
                     "RapidOCR belum tersedia. Pastikan rapidocr dan onnxruntime terpasang."
                 ) from exc
-            backend = RapidOCR()
+            model_dir = ensure_writable_rapidocr_model_dir(model_root_dir)
+            backend = RapidOCR(
+                params={
+                    "Global.model_root_dir": str(model_dir),
+                    "Global.log_level": "warning",
+                }
+            )
         self._backend = backend
 
     def read_image(self, image_content: bytes) -> str:
@@ -228,3 +237,32 @@ def _box_properties(box: Any) -> dict[str, float] | None:
         "height": max(1.0, bottom - top),
         "center_y": top + ((bottom - top) / 2),
     }
+
+
+def ensure_writable_rapidocr_model_dir(model_root_dir: str | Path | None = None) -> Path:
+    candidates = []
+    if model_root_dir:
+        candidates.append(Path(model_root_dir))
+
+    env_root = os.environ.get("RAPIDOCR_MODEL_ROOT")
+    if env_root:
+        candidates.append(Path(env_root))
+
+    candidates.extend(
+        [
+            Path.home() / ".cache" / "contract_extractor_v2" / "rapidocr",
+            Path(tempfile.gettempdir()) / "contract_extractor_v2" / "rapidocr",
+        ]
+    )
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return candidate
+        except OSError:
+            continue
+
+    raise RuntimeError("Tidak ada folder cache writable untuk model RapidOCR.")

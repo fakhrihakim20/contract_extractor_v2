@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import os
+import sys
+import tempfile
+import types
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import fitz
 
-from contract_extractor.pdf_ocr import RapidOcrEngine, extract_pdf_text
+from contract_extractor.pdf_ocr import (
+    RapidOcrEngine,
+    ensure_writable_rapidocr_model_dir,
+    extract_pdf_text,
+)
 
 
 class FakeRapidOutput:
@@ -26,6 +36,16 @@ class FakeRapidBackend:
         if self.fail:
             raise RuntimeError("ocr offline")
         return self.output
+
+
+class FakeRapidOCRFactory:
+    last_params = None
+
+    def __init__(self, *, params=None) -> None:
+        FakeRapidOCRFactory.last_params = params
+
+    def __call__(self, image_content: bytes) -> FakeRapidOutput:
+        return FakeRapidOutput()
 
 
 class PdfOcrTests(unittest.TestCase):
@@ -72,6 +92,27 @@ class PdfOcrTests(unittest.TestCase):
         self.assertEqual(extraction.pages[0].method, "rapidocr-error")
         self.assertEqual(extraction.pages[0].text, "")
         self.assertIn("RapidOCR gagal membaca halaman 1", extraction.warnings[0])
+
+    def test_rapidocr_model_dir_can_be_overridden_with_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model_dir = Path(temp_dir) / "rapidocr-cache"
+            with patch.dict(os.environ, {"RAPIDOCR_MODEL_ROOT": str(model_dir)}):
+                selected = ensure_writable_rapidocr_model_dir()
+
+        self.assertEqual(selected, model_dir)
+
+    def test_rapidocr_initializes_with_writable_model_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            FakeRapidOCRFactory.last_params = None
+            fake_module = types.SimpleNamespace(RapidOCR=FakeRapidOCRFactory)
+            with patch.dict(sys.modules, {"rapidocr": fake_module}):
+                RapidOcrEngine(model_root_dir=temp_dir)
+
+        self.assertEqual(
+            FakeRapidOCRFactory.last_params["Global.model_root_dir"],
+            temp_dir,
+        )
+        self.assertEqual(FakeRapidOCRFactory.last_params["Global.log_level"], "warning")
 
 
 def _native_pdf() -> bytes:
