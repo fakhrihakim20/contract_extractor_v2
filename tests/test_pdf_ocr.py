@@ -12,6 +12,7 @@ import fitz
 
 from contract_extractor.pdf_ocr import (
     RapidOcrEngine,
+    build_rapidocr_params,
     ensure_writable_rapidocr_model_dir,
     extract_pdf_text,
 )
@@ -106,13 +107,32 @@ class PdfOcrTests(unittest.TestCase):
             FakeRapidOCRFactory.last_params = None
             fake_module = types.SimpleNamespace(RapidOCR=FakeRapidOCRFactory)
             with patch.dict(sys.modules, {"rapidocr": fake_module}):
-                RapidOcrEngine(model_root_dir=temp_dir)
+                RapidOcrEngine(model_root_dir=temp_dir, profile="rapidocr_default")
 
         self.assertEqual(
             FakeRapidOCRFactory.last_params["Global.model_root_dir"],
             temp_dir,
         )
         self.assertEqual(FakeRapidOCRFactory.last_params["Global.log_level"], "warning")
+
+    def test_ppocrv5_profile_uses_huggingface_model_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def fake_download(repo_id, filename, cache_dir):
+                self.assertEqual(repo_id, "monkt/paddleocr-onnx")
+                target = Path(cache_dir) / filename.replace("/", "_")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("model", encoding="utf-8")
+                return str(target)
+
+            fake_hf = types.SimpleNamespace(hf_hub_download=fake_download)
+            with patch.dict(sys.modules, {"huggingface_hub": fake_hf}):
+                params = build_rapidocr_params("ppocrv5_latin_onnx", root)
+
+        self.assertIn("detection_v5_det.onnx", params["Det.model_path"])
+        self.assertIn("languages_latin_rec.onnx", params["Rec.model_path"])
+        self.assertIn("languages_latin_dict.txt", params["Rec.rec_keys_path"])
 
 
 def _native_pdf() -> bytes:

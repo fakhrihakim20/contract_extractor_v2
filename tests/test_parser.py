@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
 from contract_extractor.parser import (
     format_date_iso,
     normalize_unit_name,
     parse_boq_items,
+    parse_boq_items_from_tokens,
     parse_contract_metadata,
     parse_extraction_pages,
     parse_indonesian_currency,
@@ -36,6 +38,10 @@ class ParserTests(unittest.TestCase):
     def test_normalize_unit_name(self) -> None:
         self.assertEqual(normalize_unit_name("UPT Surabaya"), ("UPT Surabaya", "UPT Surabaya"))
         self.assertEqual(normalize_unit_name("Unit Pelaksana UPT Gresik"), ("UPT Gresik", "Unit Pelaksana UPT Gresik"))
+        self.assertEqual(
+            normalize_unit_name("UnitIndukTransmisiJawaBagianTimurDanBali UnitPelaksanaTransmisiSurabaya")[0],
+            "UPT Surabaya",
+        )
         self.assertEqual(normalize_unit_name("Area Lain"), (None, "Area Lain"))
 
     def test_parse_metadata_empty(self) -> None:
@@ -123,6 +129,48 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(items[4].unit, "ls")
         self.assertEqual(items[4].service_unit_price, 62606800.0)
 
+    def test_parse_boq_items_with_na_columns(self) -> None:
+        items = parse_boq_items(
+            """
+            BILL OF QUANTITY
+            Uraian Pekerjaan Volume Satuan Harga Satuan Jumlah Harga
+            1.3.6 KOMUNIKASI 0,25 bulan N/A 3.123.250,00 N/A 780.812,50 780.812,50
+            1.7.3 SEWAKANTORPROYEK 1,00 lot N/A 7.500.000,00 N/A 7.500.000,00 7.500.000,00
+            """,
+            source_page=37,
+        )
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0].unit, "bulan")
+        self.assertEqual(items[0].material_unit_price, 3123250.0)
+        self.assertEqual(items[0].service_unit_price, 780812.5)
+        self.assertEqual(items[1].description, "SEWA KANTOR PROYEK")
+
+    def test_parse_boq_items_from_ocr_token_columns(self) -> None:
+        tokens = [
+            _token("URAIAN PEKERJAAN", 100, 10),
+            _token("VOLUME", 450, 10),
+            _token("HARGA SATUAN", 640, 10),
+            _token("JUMLAH HARGA", 840, 10),
+            _token("1.3.6", 40, 50),
+            _token("KOMUNIKASI", 120, 50),
+            _token("0,25", 430, 50),
+            _token("bulan", 500, 50),
+            _token("N/A", 610, 50),
+            _token("3.123.250,00", 670, 50),
+            _token("N/A", 780, 50),
+            _token("780.812,50", 850, 50),
+            _token("780.812,50", 960, 50),
+        ]
+        items = parse_boq_items_from_tokens(tokens, source_page=37)
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].item_id, "1.3.6")
+        self.assertEqual(items[0].description, "KOMUNIKASI")
+        self.assertEqual(items[0].unit, "bulan")
+        self.assertEqual(items[0].material_unit_price, 3123250.0)
+        self.assertEqual(items[0].service_unit_price, 780812.5)
+        self.assertGreater(items[0].confidence, 0.35)
+
     def test_parse_extraction_ignores_numbered_contract_clauses(self) -> None:
         items = parse_boq_items(
             """
@@ -155,3 +203,16 @@ class ParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _token(text: str, left: float, top: float) -> SimpleNamespace:
+    return SimpleNamespace(
+        text=text,
+        score=0.96,
+        box=[
+            [left, top],
+            [left + max(20, len(text) * 7), top],
+            [left + max(20, len(text) * 7), top + 18],
+            [left, top + 18],
+        ],
+    )

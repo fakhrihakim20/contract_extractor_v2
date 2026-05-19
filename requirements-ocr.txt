@@ -1,6 +1,8 @@
 # OCR is now installed through requirements.txt.
 #
-# The app uses RapidOCR with ONNXRuntime locally inside Streamlit Cloud.
+# The app uses RapidOCR with ONNXRuntime locally inside Streamlit Cloud,
+# defaulting to PP-OCRv5 Latin/English ONNX models downloaded with
+# huggingface_hub into a writable cache.
 # Keep this file only as a note for operators who previously configured
 # external dots.ocr/PaddleOCR runtimes; those secrets and services are no
 # longer required.

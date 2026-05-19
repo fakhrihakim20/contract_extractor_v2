@@ -8,7 +8,7 @@ Streamlit app untuk membaca PDF kontrak dari Google Drive, mengekstrak draft met
 - Supabase Python client dengan `SUPABASE_SERVICE_ROLE_KEY` di server-side secrets
 - Google Drive API service account untuk folder PDF private
 - PyMuPDF untuk text-native PDF
-- RapidOCR + ONNXRuntime untuk fallback OCR halaman scan di CPU Streamlit
+- RapidOCR + ONNXRuntime dengan PP-OCRv5 Latin/English ONNX untuk fallback OCR halaman scan di CPU Streamlit
 - Taste-skill UI theme: premium operations console, `Outfit` + `JetBrains Mono`, matte neutral surfaces, and a single blue-gray accent
 
 ## Secrets
@@ -35,13 +35,13 @@ python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa OCR. Halaman scan akan dirender satu per satu lalu dibaca lokal dengan RapidOCR ONNXRuntime.
+PDF yang sudah punya text layer akan diproses dengan PyMuPDF tanpa OCR. Halaman scan akan dirender satu per satu lalu dibaca lokal dengan RapidOCR ONNXRuntime. Default OCR profile adalah `PP-OCRv5 Latin ONNX` karena model ini mencakup Indonesian/Latin script.
 
 ## RapidOCR Runtime
 
-`requirements.txt` memasang `rapidocr` dan `onnxruntime`, jadi tidak perlu API OCR eksternal.
+`requirements.txt` memasang `rapidocr`, `onnxruntime`, dan `huggingface_hub`, jadi tidak perlu API OCR eksternal.
 Streamlit Community Cloud tetap memiliki resource terbatas; proses scan besar dibuat satu dokumen per aksi dan satu halaman per iterasi.
-Model ONNX RapidOCR disimpan di folder writable `~/.cache/contract_extractor_v2/rapidocr`, bukan di `site-packages`, agar tidak kena `Permission denied` di Streamlit Cloud. Jika perlu override, set environment variable `RAPIDOCR_MODEL_ROOT`.
+Model ONNX RapidOCR dan PP-OCRv5 dari HuggingFace disimpan di folder writable `~/.cache/contract_extractor_v2/rapidocr`, bukan di `site-packages`, agar tidak kena `Permission denied` di Streamlit Cloud. Jika perlu override, set environment variable `RAPIDOCR_MODEL_ROOT`.
 
 Jika build Cloud gagal karena wheel Python, deploy ulang dengan Python 3.12 dari Advanced settings Streamlit.
 
@@ -62,7 +62,7 @@ Tidak ada migrasi awal. App memakai tabel lama:
 - `documents.storage_bucket = "google-drive"`
 - `documents.storage_path = "gdrive:<drive_file_id>"`
 - `documents.pdf_link = "<google_drive_web_view_link>"`
-- `extraction_jobs.model = "rapidocr-onnxruntime-v1"`
+- `extraction_jobs.model = "ppocrv5-latin-onnx-v1"`
 - Draft disimpan ke `contract_extraction_drafts` dan `boq_extraction_draft_items`
 - Approval tetap lewat `approve_contract_document`
 
@@ -85,8 +85,8 @@ PDF contoh `018 PJ Peremajaan GSW untuk Perbaikan sistem Pengamanan Petir.pdf`:
 - Ukuran: 19.175 MB
 - Halaman: 37
 - Text layer native: 0 karakter
-- RapidOCR 2x render CPU lokal: 37/37 halaman sukses, 0 kosong, 0 error
+- RapidOCR default 2x render CPU lokal: 37/37 halaman sukses, 0 kosong, 0 error
 - Total OCR: 566.449 detik
 - Rata-rata: 15.309 detik/halaman
 - Rentang halaman: 7.901-29.085 detik
-- Parser v2 mengenali metadata sampel sebagai `018.PJ/DAN.01.03/F34050000/2025`, tanggal `2025-10-13`, vendor `PT CITA YASA PERDANA`, unit `UPT Surabaya`, dan 16 baris BoQ dari lampiran.
+- Parser v3 menambahkan token/box OCR dan parser BoQ berbasis kolom sehingga baris dengan `N/A`, volume, satuan, harga material, harga jasa, dan jumlah harga tidak lagi jatuh massal ke confidence `0.350`.

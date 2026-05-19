@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import date
-from typing import Iterable
+from typing import Any, Iterable
 
 from contract_extractor.constants import UNIT_OPTIONS
 
@@ -66,6 +66,13 @@ BOQ_UNIT_WORDS = {
     "unit",
     "meler",
     "mtr",
+    "bulan",
+    "buan",
+    "bln",
+    "lembar",
+    "orang",
+    "tks",
+    "tk",
 }
 
 BOQ_UNIT_ALIASES = {
@@ -83,6 +90,13 @@ BOQ_UNIT_ALIASES = {
     "tower": "tower",
     "unit": "unit",
     "set": "set",
+    "bulan": "bulan",
+    "buan": "bulan",
+    "bln": "bulan",
+    "lembar": "lembar",
+    "orang": "orang",
+    "tks": "tks",
+    "tk": "tks",
 }
 
 
@@ -248,6 +262,27 @@ def normalize_unit_name(value: str | None) -> tuple[str | None, str | None]:
             return unit, unit
         if unit.lower() in lowered:
             return unit, compact
+    compact_key = re.sub(r"[^a-z0-9]", "", lowered)
+    unit_hints = {
+        "unitpelaksanatransmisisurabaya": "UPT Surabaya",
+        "uptsurabaya": "UPT Surabaya",
+        "transmisisurabaya": "UPT Surabaya",
+        "unitpelaksanatransmisigresik": "UPT Gresik",
+        "uptgresik": "UPT Gresik",
+        "transmisigresik": "UPT Gresik",
+        "unitpelaksanatransmisimalang": "UPT Malang",
+        "uptmalang": "UPT Malang",
+        "transmisimalang": "UPT Malang",
+        "unitpelaksanatransmisimadiun": "UPT Madiun",
+        "uptmadiun": "UPT Madiun",
+        "transmisimadiun": "UPT Madiun",
+        "unitpelaksanatransmisiprobolinggo": "UPT Probolinggo",
+        "uptprobolinggo": "UPT Probolinggo",
+        "transmisiprobolinggo": "UPT Probolinggo",
+    }
+    for token, unit in unit_hints.items():
+        if token in compact_key:
+            return unit, compact
     return None, compact
 
 
@@ -335,12 +370,19 @@ def parse_boq_items(text: str, source_page: int | None = None) -> list[BoqItem]:
     return _dedupe_items(items)
 
 
-def parse_extraction_pages(pages: Iterable[tuple[int, str]], warnings: list[str] | None = None) -> ExtractionResult:
+def parse_extraction_pages(
+    pages: Iterable[tuple[int, str]],
+    warnings: list[str] | None = None,
+    token_pages: Iterable[tuple[int, list[Any]]] | None = None,
+) -> ExtractionResult:
     page_list = [(page, clean_text(text)) for page, text in pages]
     full_text = "\n\n".join(text for _, text in page_list)
     contract = parse_contract_metadata(full_text)
 
     items: list[BoqItem] = []
+    for page_number, tokens in token_pages or []:
+        items.extend(parse_boq_items_from_tokens(tokens, page_number))
+
     for page_number, page_text in page_list:
         items.extend(parse_boq_items(page_text, page_number))
 
@@ -371,6 +413,170 @@ def parse_extraction_pages(pages: Iterable[tuple[int, str]], warnings: list[str]
         confidence_summary={"overall": overall, "notes": notes},
         warnings=notes,
     )
+
+
+def parse_boq_items_from_tokens(tokens: list[Any], source_page: int | None = None) -> list[BoqItem]:
+    if not tokens:
+        return []
+    lines = _ocr_tokens_to_lines(tokens)
+    if not _has_boq_context([" ".join(token["text"] for token in line) for line in lines]):
+        return []
+
+    items: list[BoqItem] = []
+    current_section: str | None = None
+    pending: BoqItem | None = None
+
+    for line in lines:
+        line_text = _normalize_boq_line(" ".join(token["text"] for token in line))
+        current_section = _update_boq_section(line_text, current_section)
+        if _is_header_line(line_text) or _looks_like_non_boq_description(line_text):
+            continue
+
+        item = _parse_boq_token_line(line, source_page, current_section)
+        if item:
+            if pending:
+                items.append(pending)
+            pending = item
+            continue
+
+        if pending and _looks_like_continuation_line(line_text):
+            pending.description = _repair_boq_description(f"{pending.description} {line_text}")
+            pending.source_text = f"{pending.source_text or ''} {line_text}"[:500]
+
+    if pending:
+        items.append(pending)
+    return _dedupe_items(items)
+
+
+def _ocr_tokens_to_lines(tokens: list[Any]) -> list[list[dict[str, Any]]]:
+    positioned = []
+    for token in tokens:
+        props = _token_box_props(token)
+        text = clean_text(str(getattr(token, "text", "") or ""))
+        if not props or not text:
+            continue
+        score = getattr(token, "score", None)
+        if isinstance(score, (int, float)) and score < 0.25:
+            continue
+        positioned.append({**props, "text": text, "score": score})
+
+    positioned.sort(key=lambda item: (item["center_y"], item["left"]))
+    lines: list[list[dict[str, Any]]] = []
+    centers: list[float] = []
+    heights: list[float] = []
+    for token in positioned:
+        if not lines:
+            lines.append([token])
+            centers.append(token["center_y"])
+            heights.append(token["height"])
+            continue
+        threshold = max(8.0, min(heights[-1], token["height"]) * 0.7)
+        if abs(token["center_y"] - centers[-1]) <= threshold:
+            lines[-1].append(token)
+            centers[-1] = (centers[-1] + token["center_y"]) / 2
+            heights[-1] = max(heights[-1], token["height"])
+        else:
+            lines.append([token])
+            centers.append(token["center_y"])
+            heights.append(token["height"])
+
+    return [sorted(line, key=lambda item: item["left"]) for line in lines]
+
+
+def _token_box_props(token: Any) -> dict[str, float] | None:
+    box = getattr(token, "box", None)
+    try:
+        points = [tuple(point) for point in box]
+        xs = [float(point[0]) for point in points]
+        ys = [float(point[1]) for point in points]
+    except Exception:
+        return None
+    if not xs or not ys:
+        return None
+    left = min(xs)
+    right = max(xs)
+    top = min(ys)
+    bottom = max(ys)
+    return {
+        "left": left,
+        "right": right,
+        "top": top,
+        "bottom": bottom,
+        "center_x": left + ((right - left) / 2),
+        "center_y": top + ((bottom - top) / 2),
+        "height": max(1.0, bottom - top),
+    }
+
+
+def _parse_boq_token_line(
+    line: list[dict[str, Any]],
+    source_page: int | None,
+    section: str | None,
+) -> BoqItem | None:
+    if len(line) < 3:
+        return None
+    first_text = line[0]["text"].strip()
+    first_match = re.match(r"^((?:\d+[.\-])*\d+)[.)]?$", first_text)
+    if not first_match:
+        merged_match = re.match(r"^((?:\d+[.\-])*\d+)[.)]?\s+(.+)$", first_text)
+        if not merged_match:
+            return None
+        line = [{**line[0], "text": merged_match.group(1)}, {**line[0], "text": merged_match.group(2)}, *line[1:]]
+
+    item_id = re.sub(r"[.)]+$", "", line[0]["text"].strip())
+    token_texts = [token["text"] for token in line[1:]]
+    quantity = _find_quantity_unit(token_texts)
+    if quantity is None:
+        return None
+    unit_index, unit = quantity
+    description_end = _description_end_before_quantity(token_texts, unit_index)
+    description = _repair_boq_description(" ".join(token_texts[:description_end]).strip(" :-"))
+    if len(description) < 3 or _looks_like_non_boq_description(description):
+        return None
+
+    price_tokens = token_texts[unit_index + 1 :]
+    prices = _extract_price_values(price_tokens)
+    if not prices:
+        return None
+
+    material_price, service_price = _assign_column_prices(prices, section)
+    warnings = ["parsed_by_columns"]
+    if len(prices) == 1:
+        warnings.append("ambiguous_prices")
+    if "n/a" in " ".join(token_texts).lower():
+        warnings.append("na_columns_ignored")
+
+    return BoqItem(
+        item_id=item_id,
+        description=description,
+        unit=unit,
+        material_unit_price=material_price,
+        service_unit_price=service_price,
+        source_page=source_page,
+        source_text=_normalize_boq_line(" ".join([token["text"] for token in line]))[:500],
+        confidence=0.88 if len(prices) >= 2 else 0.78,
+        warnings=warnings,
+    )
+
+
+def _assign_column_prices(prices: list[float], section: str | None) -> tuple[float | None, float | None]:
+    if section == "material":
+        return prices[0], None
+    if section == "jasa":
+        return None, prices[0]
+    if len(prices) >= 2:
+        return prices[0], prices[1]
+    return prices[0], None
+
+
+def _looks_like_continuation_line(line: str) -> bool:
+    if not line:
+        return False
+    if _item_id_match(line):
+        return False
+    lowered = line.lower()
+    blocked = ["jumlah", "total", "harga satuan", "uraian pekerjaan", "bill of quantity"]
+    return not any(token in lowered for token in blocked)
 
 
 def _safe_date(year: int, month: int, day: int) -> str | None:
@@ -478,6 +684,9 @@ def _find_unit_text(text: str) -> str | None:
 
 def _normalize_boq_line(line: str) -> str:
     line = line.replace("|", " ")
+    line = re.sub(r"(?i)\bn\s*/\s*a\b", " N/A ", line)
+    line = re.sub(r"([A-Za-z])(\d+[,.]\d{2,})", r"\1 \2", line)
+    line = re.sub(r"(\d)([A-Za-z]{2,})(?=\s|$)", r"\1 \2", line)
     line = re.sub(r"\s+", " ", line)
     return line.strip()
 
@@ -527,32 +736,22 @@ def _parse_boq_line(line: str, source_page: int | None) -> BoqItem | None:
     if len(tokens) < 4:
         return None
 
-    stripped_tokens = [token for token in tokens if token.lower().strip(".") != "rp"]
-    prices: list[float] = []
-    price_token_count = 0
-    index = len(stripped_tokens) - 1
-
-    while index >= 0 and len(prices) < 2:
-        token = stripped_tokens[index]
-        parsed = parse_indonesian_currency(token)
-        if parsed is None or not re.search(r"\d", token):
-            break
-        prices.insert(0, parsed)
-        price_token_count += 1
-        index -= 1
-
+    stripped_tokens = [
+        token
+        for token in tokens
+        if token.lower().strip(".,") not in {"rp", "n/a", "na", "-"}
+    ]
+    quantity = _find_quantity_unit(stripped_tokens)
+    if quantity is None:
+        unit_index, unit, prices = _find_unit_then_prices(stripped_tokens)
+    else:
+        unit_index, unit = quantity
+        prices = _extract_price_values(stripped_tokens[unit_index + 1 :])
     if not prices:
         return None
 
-    unit_index = len(stripped_tokens) - price_token_count - 1
-    if unit_index < 1:
-        return None
-
-    unit = stripped_tokens[unit_index].strip(".,;:")
-    if unit.lower() not in BOQ_UNIT_WORDS:
-        return None
-
-    description = " ".join(stripped_tokens[:unit_index]).strip(" :-")
+    description_end = _description_end_before_quantity(stripped_tokens, unit_index)
+    description = _repair_boq_description(" ".join(stripped_tokens[:description_end]).strip(" :-"))
     if len(description) < 3:
         return None
 
@@ -561,6 +760,8 @@ def _parse_boq_line(line: str, source_page: int | None) -> BoqItem | None:
     warnings: list[str] = []
     if len(prices) == 1:
         warnings.append("Hanya satu kolom harga terbaca.")
+    if len(prices) > 2:
+        warnings.append("Harga total terdeteksi dan diabaikan.")
 
     return BoqItem(
         item_id=item_id,
@@ -570,7 +771,7 @@ def _parse_boq_line(line: str, source_page: int | None) -> BoqItem | None:
         service_unit_price=service_price,
         source_page=source_page,
         source_text=line[:500],
-        confidence=0.72 if warnings else 0.82,
+        confidence=0.76 if warnings else 0.84,
         warnings=warnings,
     )
 
@@ -607,7 +808,7 @@ def _parse_boq_table_line(
     if not prices:
         return None
 
-    description = _repair_boq_description(" ".join(tokens[:quantity_index]))
+    description = _repair_boq_description(" ".join(tokens[: _description_end_before_quantity(tokens, quantity_index)]))
     if len(description) < 3 or _looks_like_non_boq_description(description):
         return None
 
@@ -643,6 +844,41 @@ def _find_quantity_unit(tokens: list[str]) -> tuple[int, str] | None:
     return None
 
 
+def _description_end_before_quantity(tokens: list[str], unit_index: int) -> int:
+    if unit_index > 0 and re.fullmatch(r"\d[\d.,]*", tokens[unit_index - 1]):
+        return unit_index - 1
+    return unit_index
+
+
+def _find_unit_then_prices(tokens: list[str]) -> tuple[int, str, list[float]]:
+    for index in range(len(tokens) - 1, -1, -1):
+        unit = _normalize_boq_unit(tokens[index])
+        if not unit:
+            continue
+        prices = _extract_price_values(tokens[index + 1 :])
+        if prices:
+            return index, tokens[index].strip(".,;:"), prices
+    return -1, "", []
+
+
+def _extract_price_values(tokens: list[str]) -> list[float]:
+    prices = []
+    for token in tokens:
+        normalized = token.lower().strip(".,;:")
+        if normalized in {"rp", "n/a", "na", "-"}:
+            continue
+        if not re.search(r"\d", token):
+            continue
+        value = parse_indonesian_currency(token)
+        if value is not None:
+            prices.append(value)
+    if len(prices) >= 4:
+        return [prices[0], prices[2]]
+    if len(prices) == 3:
+        return prices[:2]
+    return prices[:2]
+
+
 def _normalize_boq_unit(value: str) -> str | None:
     normalized = value.lower().strip(".,;:()")
     return BOQ_UNIT_ALIASES.get(normalized)
@@ -657,6 +893,7 @@ def _looks_like_non_boq_description(value: str) -> bool:
 def _repair_boq_description(value: str) -> str:
     replacements = [
         (r"\bShockDumper", "Shock Dumper"),
+        (r"\bAS55 mm\b", "AS55mm"),
         (r"DumperAS", "Dumper AS"),
         (r"\bArmourroduntuk", "Armour rod untuk "),
         (r"SuspensionClamp", "Suspension Clamp"),
@@ -680,6 +917,14 @@ def _repair_boq_description(value: str) -> str:
         (r"UPTkelokasi", "UPT ke lokasi"),
         (r"\bkelokasi", "ke lokasi"),
         (r"\bBongkardanpasang", "Bongkar dan pasang"),
+        (r"\bSEWAKANTORPROYEK\b", "SEWA KANTOR PROYEK"),
+        (r"\bSEWALAPTOP\b", "SEWA LAPTOP"),
+        (r"\bSOFTCOPY\b", "SOFT COPY"),
+        (r"\bKOMUNIKASI\b", "KOMUNIKASI"),
+        (r"\bPeremajaanGsw", "Peremajaan GSW"),
+        (r"\bpengamanPetir", "pengaman Petir"),
+        (r"danpasang", "dan pasang"),
+        (r"PengamananPetir", "Pengamanan Petir"),
     ]
     repaired = value
     for pattern, replacement in replacements:

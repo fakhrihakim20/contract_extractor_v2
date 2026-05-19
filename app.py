@@ -17,7 +17,14 @@ from contract_extractor.constants import (
 )
 from contract_extractor.drive_client import DrivePdfFile, GoogleDriveClient
 from contract_extractor.parser import parse_extraction_pages
-from contract_extractor.pdf_ocr import RapidOcrEngine, extract_pdf_text
+from contract_extractor.pdf_ocr import (
+    DEFAULT_OCR_PROFILE,
+    OCR_PROFILES,
+    OCR_PROFILE_OPTIONS,
+    RapidOcrEngine,
+    extract_pdf_text,
+    normalize_ocr_profile,
+)
 from contract_extractor.supabase_repo import SupabaseRepository, document_pdf_link, drive_pdf_link
 from contract_extractor.ui_style import (
     empty_panel,
@@ -43,6 +50,7 @@ DOCUMENT_STATUS_VALUES = {
     "Approved": "approved",
 }
 INFRASTRUCTURE_FAILURE_STAGES = {"ocr", "save_to_supabase"}
+OCR_PROFILE_LABELS = {key: OCR_PROFILES[key].label for key in OCR_PROFILE_OPTIONS}
 
 
 class ProcessingStageError(RuntimeError):
@@ -86,7 +94,7 @@ def main() -> None:
             ("Dokumen", str(len(documents))),
             ("Needs review", str(sum(1 for doc in documents if doc.get("status") == "needs_review"))),
             ("Approved", str(len(contracts))),
-            ("OCR engine", "RapidOCR ONNX"),
+            ("OCR engine", OCR_PROFILE_LABELS[DEFAULT_OCR_PROFILE]),
         ]
     )
 
@@ -94,7 +102,7 @@ def main() -> None:
     with intake_tab:
         render_drive_intake(repo, drive, documents)
     with review_tab:
-        render_review(repo, documents)
+        render_review(repo, drive, documents)
     with final_tab:
         render_final_data(contracts)
 
@@ -110,8 +118,8 @@ def get_drive_client(service_account_json: str, folder_id: str) -> GoogleDriveCl
 
 
 @st.cache_resource(show_spinner=False)
-def get_ocr_engine() -> RapidOcrEngine:
-    return RapidOcrEngine()
+def get_ocr_engine(profile: str = DEFAULT_OCR_PROFILE) -> RapidOcrEngine:
+    return RapidOcrEngine(profile=normalize_ocr_profile(profile))
 
 
 def new_batch_summary() -> dict[str, list[str]]:
@@ -147,7 +155,7 @@ def ocr_preflight_summary(preflight: Callable[[], None]) -> dict[str, list[str]]
     return None
 
 
-def preflight_ocr_runtime() -> None:
+def preflight_ocr_runtime(profile: str = DEFAULT_OCR_PROFILE) -> None:
     try:
         import fitz  # noqa: F401
     except Exception as exc:
@@ -157,11 +165,11 @@ def preflight_ocr_runtime() -> None:
             infrastructure=True,
         ) from exc
     try:
-        get_ocr_engine()
+        get_ocr_engine(profile)
     except Exception as exc:
         raise ProcessingStageError(
             "ocr",
-            f"RapidOCR runtime tidak siap: {exc}",
+            f"RapidOCR runtime tidak siap untuk profile {OCR_PROFILE_LABELS.get(profile, profile)}: {exc}",
             infrastructure=True,
         ) from exc
 
@@ -176,7 +184,15 @@ def render_drive_intake(
         "Read PDFs from the shared folder, import only the files you need, then process one document at a time through local RapidOCR ONNXRuntime.",
         "manual sync",
     )
-    st.caption("OCR engine: `RapidOCR ONNXRuntime` local CPU. No OpenAI, Google OCR, or external OCR endpoint.")
+    st.caption("OCR engine: local ONNXRuntime CPU. No OpenAI, Google OCR, or external OCR endpoint.")
+    ocr_profile = st.selectbox(
+        "OCR profile",
+        OCR_PROFILE_OPTIONS,
+        index=OCR_PROFILE_OPTIONS.index(DEFAULT_OCR_PROFILE),
+        format_func=lambda value: OCR_PROFILE_LABELS.get(value, value),
+        help="PP-OCRv5 Latin adalah default untuk dokumen Indonesia/PLN; English dan RapidOCR default tersedia untuk percobaan ulang.",
+        key="drive_ocr_profile",
+    )
 
     col_a, col_b = st.columns([1, 1], vertical_alignment="bottom")
     with col_a:
@@ -298,7 +314,7 @@ def render_drive_intake(
                 use_container_width=True,
                 disabled=not selected_files,
             ):
-                summary = import_and_process_selected(repo, drive, selected_files)
+                summary = import_and_process_selected(repo, drive, selected_files, ocr_profile)
                 render_batch_summary(summary, skipped_files)
                 if not summary["failed"]:
                     st.rerun()
@@ -388,7 +404,7 @@ def render_drive_intake(
             use_container_width=True,
             disabled=not selected_documents,
         ):
-            summary = process_imported_documents(repo, drive, selected_documents)
+            summary = process_imported_documents(repo, drive, selected_documents, ocr_profile)
             render_batch_summary(summary, [])
             if not summary["failed"] and not summary.get("stopped"):
                 st.rerun()
@@ -399,7 +415,7 @@ def render_drive_intake(
             use_container_width=True,
             disabled=not selected_failed_documents,
         ):
-            summary = process_imported_documents(repo, drive, selected_failed_documents)
+            summary = process_imported_documents(repo, drive, selected_failed_documents, ocr_profile)
             render_batch_summary(summary, [])
             if not summary["failed"] and not summary.get("stopped"):
                 st.rerun()
@@ -517,8 +533,9 @@ def import_and_process_selected(
     repo: SupabaseRepository,
     drive: GoogleDriveClient,
     files: list[DrivePdfFile],
+    ocr_profile: str = DEFAULT_OCR_PROFILE,
 ) -> dict[str, list[str]]:
-    preflight_summary = ocr_preflight_summary(preflight_ocr_runtime)
+    preflight_summary = ocr_preflight_summary(lambda: preflight_ocr_runtime(ocr_profile))
     if preflight_summary:
         return preflight_summary
 
@@ -534,7 +551,7 @@ def import_and_process_selected(
         try:
             document = repo.import_drive_file(file)
             summary["imported"].append(file.name)
-            process_document(repo, drive, document["id"], file.id)
+            process_document(repo, drive, document["id"], file.id, ocr_profile=ocr_profile)
             summary["processed"].append(file.name)
         except Exception as exc:
             summary["failed"].append(f"{file.name}: {exc}")
@@ -550,8 +567,9 @@ def process_imported_documents(
     repo: SupabaseRepository,
     drive: GoogleDriveClient,
     documents: list[dict[str, Any]],
+    ocr_profile: str = DEFAULT_OCR_PROFILE,
 ) -> dict[str, list[str]]:
-    preflight_summary = ocr_preflight_summary(preflight_ocr_runtime)
+    preflight_summary = ocr_preflight_summary(lambda: preflight_ocr_runtime(ocr_profile))
     if preflight_summary:
         return preflight_summary
 
@@ -567,7 +585,7 @@ def process_imported_documents(
             summary["failed"].append(f"{filename}: Dokumen ini tidak memiliki Drive file id.")
             continue
         try:
-            process_document(repo, drive, document["id"], drive_file_id)
+            process_document(repo, drive, document["id"], drive_file_id, ocr_profile=ocr_profile)
             summary["processed"].append(str(filename))
         except Exception as exc:
             summary["failed"].append(f"{filename}: {exc}")
@@ -599,7 +617,11 @@ def render_batch_summary(
         st.warning("Stopped: " + " | ".join(summary["stopped"][:3]))
 
 
-def render_review(repo: SupabaseRepository, documents: list[dict[str, Any]]) -> None:
+def render_review(
+    repo: SupabaseRepository,
+    drive: GoogleDriveClient,
+    documents: list[dict[str, Any]],
+) -> None:
     section_intro(
         "Review Draft",
         "Validate the extracted contract metadata and BoQ rows before sending the record to the final Supabase tables.",
@@ -635,6 +657,30 @@ def render_review(repo: SupabaseRepository, documents: list[dict[str, Any]]) -> 
     if document.get("error_message"):
         st.error(document["error_message"])
 
+    render_ocr_preview(job)
+
+    reprocess_a, reprocess_b = st.columns([2, 1], vertical_alignment="bottom")
+    with reprocess_a:
+        review_ocr_profile = st.selectbox(
+            "Reprocess with OCR profile",
+            OCR_PROFILE_OPTIONS,
+            index=OCR_PROFILE_OPTIONS.index(DEFAULT_OCR_PROFILE),
+            format_func=lambda value: OCR_PROFILE_LABELS.get(value, value),
+            key="review_ocr_profile",
+        )
+    with reprocess_b:
+        if st.button("Reprocess draft", use_container_width=True):
+            drive_file_id = repo.drive_id_from_storage_path(document.get("storage_path"))
+            if not drive_file_id:
+                st.error("Dokumen ini tidak punya Drive file id.")
+            else:
+                try:
+                    process_document(repo, drive, document["id"], drive_file_id, ocr_profile=review_ocr_profile)
+                    st.success("Draft diproses ulang.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Reprocess gagal: {exc}")
+
     contract_payload = render_contract_form(draft)
     edited_items = render_items_editor(items)
 
@@ -656,6 +702,47 @@ def render_review(repo: SupabaseRepository, documents: list[dict[str, Any]]) -> 
                 st.rerun()
             except Exception as exc:
                 st.error(f"Approval gagal: {exc}")
+
+
+def render_ocr_preview(job: dict[str, Any] | None) -> None:
+    raw_output = (job or {}).get("raw_output") or {}
+    context = raw_output.get("context") or {}
+    page_previews = context.get("page_previews") or []
+    with st.expander("OCR Preview", expanded=False):
+        if not context:
+            st.caption("Belum ada raw OCR context untuk dokumen ini. Reprocess dokumen untuk membuat preview.")
+            return
+        cols = st.columns(5)
+        cols[0].metric("Profile", context.get("ocr_profile_label") or context.get("ocr_profile") or "-")
+        cols[1].metric("Pages", str(context.get("page_count") or "-"))
+        cols[2].metric("OCR pages", str(context.get("ocr_page_count") or "-"))
+        cols[3].metric("Sec/page", str(context.get("seconds_per_page") or "-"))
+        cols[4].metric("Preprocess", context.get("preprocessing") or "-")
+
+        if not page_previews:
+            st.caption("Preview halaman belum tersimpan pada job lama. Reprocess dokumen untuk melihat token/table preview.")
+            return
+
+        page_numbers = [int(page.get("page_number") or 0) for page in page_previews]
+        selected_page = st.selectbox("OCR page", page_numbers, key="ocr_preview_page")
+        preview = next(
+            (page for page in page_previews if int(page.get("page_number") or 0) == selected_page),
+            page_previews[0],
+        )
+        st.caption(
+            f"Method: `{preview.get('method')}` | "
+            f"tokens: `{preview.get('token_count')}` | "
+            f"elapsed: `{preview.get('elapsed_seconds')}s`"
+        )
+        st.text_area(
+            "OCR text preview",
+            value=str(preview.get("text_preview") or ""),
+            height=180,
+            disabled=True,
+        )
+        token_rows = preview.get("tokens") or []
+        if token_rows:
+            st.dataframe(pd.DataFrame(token_rows), use_container_width=True, hide_index=True)
 
 
 def render_contract_form(draft: dict[str, Any]) -> dict[str, Any]:
@@ -818,6 +905,7 @@ def process_document(
     drive: GoogleDriveClient,
     document_id: str,
     drive_file_id: str,
+    ocr_profile: str = DEFAULT_OCR_PROFILE,
 ) -> None:
     repo.mark_processing(document_id)
     try:
@@ -840,11 +928,11 @@ def process_document(
 
                 started = time.perf_counter()
                 try:
-                    ocr_engine = get_ocr_engine()
+                    ocr_engine = get_ocr_engine(ocr_profile)
                 except Exception as exc:
                     raise ProcessingStageError(
                         "ocr",
-                        f"RapidOCR runtime tidak siap: {exc}",
+                        f"RapidOCR runtime tidak siap untuk profile {OCR_PROFILE_LABELS.get(ocr_profile, ocr_profile)}: {exc}",
                         infrastructure=True,
                     ) from exc
                 try:
@@ -868,6 +956,7 @@ def process_document(
             result = parse_extraction_pages(
                 pdf_text.as_parser_pages(),
                 warnings=pdf_text.warnings,
+                token_pages=pdf_text.as_token_pages(),
             )
         except Exception as exc:
             raise ProcessingStageError("parser", exc) from exc
@@ -880,11 +969,21 @@ def process_document(
                 result,
                 raw_context={
                     "page_count": len(pdf_text.pages),
+                    "ocr_engine": "RapidOCR ONNXRuntime",
+                    "ocr_profile": ocr_profile,
+                    "ocr_profile_label": OCR_PROFILE_LABELS.get(ocr_profile, ocr_profile),
+                    "model_paths": getattr(ocr_engine, "model_paths", {}),
+                    "render_scale": OCR_PROFILES[normalize_ocr_profile(ocr_profile)].render_scale,
+                    "preprocessing": OCR_PROFILES[normalize_ocr_profile(ocr_profile)].preprocessing,
                     "ocr_pages": [
                         page.page_number for page in pdf_text.pages if page.method == "rapidocr"
                     ],
                     "ocr_page_count": ocr_page_count,
                     "methods": [page.method for page in pdf_text.pages],
+                    "token_counts": {
+                        str(page.page_number): len(page.tokens) for page in pdf_text.pages
+                    },
+                    "page_previews": pdf_text.page_previews(),
                     "elapsed_seconds": round(elapsed_seconds, 3),
                     "seconds_per_page": round(seconds_per_page, 3),
                     "pdf_size_mb": round(len(pdf_bytes) / 1024 / 1024, 3),
